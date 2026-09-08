@@ -7,6 +7,7 @@
 //!
 //! [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
@@ -110,6 +111,7 @@ impl FileSizeHistogram {
     /// - All arrays have the same length (>= 2)
     /// - The first boundary is 0
     /// - Boundaries are sorted in ascending order
+    #[internal_api]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,

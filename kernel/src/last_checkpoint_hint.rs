@@ -2,6 +2,7 @@
 //! log_segment module since it should only really be used there? as hint for listing?
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,42 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
+    /// Reconstructs a bounded checkpoint hint from its serialized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the optional checkpoint schema string is not a valid Delta schema.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        version: Version,
+        size: i64,
+        parts: Option<usize>,
+        size_in_bytes: Option<i64>,
+        num_of_add_files: Option<i64>,
+        checkpoint_schema: Option<String>,
+        checksum: Option<String>,
+        tags: Option<HashMap<String, String>>,
+        v2_checkpoint: Option<LastCheckpointV2>,
+    ) -> DeltaResult<Self> {
+        let checkpoint_schema = checkpoint_schema
+            .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
+            .transpose()?;
+        Ok(Self {
+            version,
+            size,
+            parts,
+            size_in_bytes,
+            num_of_add_files,
+            checkpoint_schema,
+            checksum,
+            tags,
+            v2_checkpoint,
+        }
+        .drop_oversized_fields())
+    }
+
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
     /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
     /// not enough: the hint's own identity must equal the selected checkpoint's.
@@ -235,6 +272,27 @@ impl LastCheckpointHint {
     #[cfg(test)]
     pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Failed to convert LastCheckpointHint to JSON bytes")
+    }
+}
+
+impl LastCheckpointV2 {
+    /// Reconstructs V2 checkpoint state from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn from_parts(
+        path: String,
+        size_in_bytes: Option<i64>,
+        modification_time: Option<i64>,
+        sidecar_files: Option<Vec<Sidecar>>,
+        non_file_actions: Option<Vec<HintAction>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            sidecar_files,
+            non_file_actions,
+        }
     }
 }
 

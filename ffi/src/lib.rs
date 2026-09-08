@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -75,6 +75,7 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+pub mod snapshot_hint;
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -1120,15 +1121,17 @@ pub struct SharedMetadata;
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
 /// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
 /// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
-/// catalog-managed tables). Finally, call [`snapshot_builder_build`] to consume the builder and
-/// obtain the snapshot. If you need to discard the builder without building, call
-/// [`free_snapshot_builder`].
+/// catalog-managed tables), or construct a complete typed snapshot hint with
+/// [`snapshot_hint::snapshot_builder_snapshot_hint_begin`] and its setters. Finally, call
+/// [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you need to
+/// discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
+    snapshot_hint: snapshot_hint::FfiSnapshotHintState,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
@@ -1150,6 +1153,7 @@ fn make_snapshot_builder(
         version: None,
         log_tail: Vec::new(),
         max_catalog_version: None,
+        snapshot_hint: snapshot_hint::FfiSnapshotHintState::None,
     })
     .into())
 }
@@ -1288,6 +1292,17 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     }
     if let Some(mcv) = builder.max_catalog_version {
         rust_builder = rust_builder.with_max_catalog_version(mcv);
+    }
+    match builder.snapshot_hint {
+        snapshot_hint::FfiSnapshotHintState::None => {}
+        snapshot_hint::FfiSnapshotHintState::Ready(hint) => {
+            rust_builder = rust_builder.with_snapshot_hint(*hint);
+        }
+        snapshot_hint::FfiSnapshotHintState::Building(_) => {
+            return Err(Error::InvalidSnapshotHint(
+                "snapshot hint visitor is unfinished".to_string(),
+            ));
+        }
     }
     let snapshot = rust_builder.build(engine.as_ref())?;
     Ok(snapshot.into())

@@ -95,7 +95,6 @@ void print_table_type(TableType tt) {
   }
 }
 
-// utility to print out a snapshot load type
 void print_load_type(SnapshotLoadType lt) {
   printf("  load_type:");
   switch (lt) {

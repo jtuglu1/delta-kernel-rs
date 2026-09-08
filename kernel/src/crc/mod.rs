@@ -106,6 +106,66 @@ pub struct Crc {
 }
 
 impl Crc {
+    /// Creates a validated complete CRC from reconstructed state.
+    ///
+    /// The caller supplies canonical protocol and metadata objects directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for negative file totals, an invalid file-size histogram, duplicate keys,
+    /// or domain-metadata tombstones.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_complete(
+        version: Version,
+        metadata: Metadata,
+        protocol: Protocol,
+        num_files: i64,
+        table_size_bytes: i64,
+        file_size_histogram: Option<FileSizeHistogram>,
+        in_commit_timestamp_opt: Option<i64>,
+        set_transactions: Option<Vec<SetTransaction>>,
+        domain_metadata: Option<Vec<DomainMetadata>>,
+    ) -> DeltaResult<Self> {
+        for (name, value) in [
+            ("numFiles", num_files),
+            ("tableSizeBytes", table_size_bytes),
+        ] {
+            if value < 0 {
+                return Err(Error::generic(format!(
+                    "CRC has invalid {name}: expected a non-negative value, got {value}"
+                )));
+            }
+        }
+        let file_size_histogram = file_size_histogram
+            .map(FileSizeHistogram::check_non_negative)
+            .transpose()
+            .map_err(|error| Error::generic(error.to_string()))?;
+        let set_transaction_state =
+            set_transaction_state(set_transactions).map_err(Error::generic)?;
+        let domain_metadata_state =
+            domain_metadata_state(domain_metadata).map_err(Error::generic)?;
+        Ok(Self {
+            version,
+            metadata,
+            protocol,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files,
+                table_size_bytes,
+                file_size_histogram,
+            }),
+            in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+            txn_id: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        })
+    }
+
     /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
     ///
     /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
@@ -213,20 +273,12 @@ impl Crc {
             in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
-            set_transaction_state: match raw.set_transactions {
-                Some(v) => SetTransactionState::Complete(
-                    v.into_iter().map(|t| (t.app_id.clone(), t)).collect(),
-                ),
-                None => SetTransactionState::Partial(HashMap::new()),
-            },
+            set_transaction_state: set_transaction_state(raw.set_transactions)
+                .map_err(Error::generic)?,
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
-            domain_metadata_state: match raw.domain_metadata {
-                Some(v) => DomainMetadataState::Complete(
-                    v.into_iter().map(|d| (d.domain().to_string(), d)).collect(),
-                ),
-                None => DomainMetadataState::Partial(HashMap::new()),
-            },
+            domain_metadata_state: domain_metadata_state(raw.domain_metadata)
+                .map_err(Error::generic)?,
             // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
             txn_id: None,
             all_files: None,
@@ -288,6 +340,7 @@ where
             hist.file_counts,
             hist.total_bytes,
         )
+        .and_then(FileSizeHistogram::check_non_negative)
         .map(Some)
         .map_err(serde::de::Error::custom),
         None => Ok(None),
@@ -318,15 +371,61 @@ pub struct DeletedRecordCountsHistogram {
     pub(crate) deleted_record_counts: Vec<i64>,
 }
 
+fn set_transaction_state(
+    values: Option<Vec<SetTransaction>>,
+) -> Result<SetTransactionState, String> {
+    let Some(values) = values else {
+        return Ok(SetTransactionState::Partial(HashMap::new()));
+    };
+    let mut transactions = HashMap::with_capacity(values.len());
+    for transaction in values {
+        let app_id = transaction.app_id.clone();
+        if transactions.insert(app_id.clone(), transaction).is_some() {
+            return Err(format!(
+                "complete CRC state contains duplicate transaction application id {app_id}"
+            ));
+        }
+    }
+    Ok(SetTransactionState::Complete(transactions))
+}
+
+fn domain_metadata_state(
+    values: Option<Vec<DomainMetadata>>,
+) -> Result<DomainMetadataState, String> {
+    let Some(values) = values else {
+        return Ok(DomainMetadataState::Partial(HashMap::new()));
+    };
+    let mut domains = HashMap::with_capacity(values.len());
+    for action in values {
+        if action.is_removed() {
+            return Err(format!(
+                "complete CRC state contains a tombstone for domain {}",
+                action.domain()
+            ));
+        }
+        let domain = action.domain().to_string();
+        if domains.insert(domain.clone(), action).is_some() {
+            return Err(format!(
+                "complete CRC state contains duplicate domain {domain}"
+            ));
+        }
+    }
+    Ok(DomainMetadataState::Complete(domains))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use rstest::rstest;
 
-    use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
-    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
+    use super::{
+        Crc, CrcRaw, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState,
+        SetTransactionState,
+    };
+    use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
+    use crate::Error;
 
     /// A minimal valid protocol for round-trip tests. `Protocol::default()` is `(0, 0)`, which
     /// `try_new` rejects, so a default protocol can't round-trip through serde (deserialization
@@ -347,6 +446,51 @@ mod tests {
             domain_metadata_state,
             ..Default::default()
         }
+    }
+
+    fn complete_crc(
+        histogram: Option<FileSizeHistogram>,
+        transactions: Option<Vec<SetTransaction>>,
+        domains: Option<Vec<DomainMetadata>>,
+    ) -> Result<Crc, Error> {
+        Crc::try_new_complete(
+            0,
+            Metadata::default(),
+            valid_protocol(),
+            0,
+            0,
+            histogram,
+            None,
+            transactions,
+            domains,
+        )
+    }
+
+    #[test]
+    fn complete_crc_rejects_negative_histogram_bins() {
+        let histogram = FileSizeHistogram::try_new(vec![0, 10], vec![-1, 0], vec![-5, 0]).unwrap();
+        assert!(complete_crc(Some(histogram), None, None).is_err());
+    }
+
+    #[test]
+    fn complete_crc_rejects_duplicate_transaction_ids() {
+        let transactions = vec![
+            SetTransaction::new("app".to_string(), 1, None),
+            SetTransaction::new("app".to_string(), 2, None),
+        ];
+        assert!(complete_crc(None, Some(transactions), None).is_err());
+    }
+
+    #[test]
+    fn complete_crc_rejects_domain_tombstones_and_duplicates() {
+        let tombstone = DomainMetadata::remove("domain".to_string(), "{}".to_string());
+        assert!(complete_crc(None, None, Some(vec![tombstone])).is_err());
+
+        let domains = vec![
+            DomainMetadata::new("domain".to_string(), "one".to_string()),
+            DomainMetadata::new("domain".to_string(), "two".to_string()),
+        ];
+        assert!(complete_crc(None, None, Some(domains)).is_err());
     }
 
     #[test]

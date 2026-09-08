@@ -42,19 +42,54 @@ pub(crate) enum SnapshotHintVersionStatus {
 #[internal_api]
 pub(crate) struct SnapshotHint {
     /// The table version described by every component of this hint.
-    pub version: Version,
+    version: Version,
     /// The complete set of log files required by the snapshot.
-    pub log_segment_files: LogSegmentFiles,
+    log_segment_files: LogSegmentFiles,
     /// The table protocol at `version`.
-    pub protocol: Protocol,
+    protocol: Protocol,
     /// The table metadata at `version`.
-    pub metadata: Metadata,
+    metadata: Metadata,
     /// The optional `_last_checkpoint` contents associated with the log segment.
-    pub last_checkpoint_hint: Option<LastCheckpointHint>,
+    last_checkpoint_hint: Option<LastCheckpointHint>,
     /// The optional pre-resolved CRC state at `version`.
-    pub crc: Option<Arc<Crc>>,
+    crc: Option<Arc<Crc>>,
     /// Whether the connector established that `version` was latest.
-    pub version_status: SnapshotHintVersionStatus,
+    version_status: SnapshotHintVersionStatus,
+}
+
+impl SnapshotHint {
+    /// Creates a hint from connector-provided log paths and table state.
+    ///
+    /// The paths pass through the same classification logic used by storage listing. Snapshot
+    /// construction performs the remaining consistency and table-configuration validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the paths cannot be classified as Delta log files.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new(
+        version: Version,
+        log_paths: Vec<LogPath>,
+        protocol: Protocol,
+        metadata: Metadata,
+        last_checkpoint_hint: Option<LastCheckpointHint>,
+        crc: Option<Arc<Crc>>,
+        version_status: SnapshotHintVersionStatus,
+    ) -> DeltaResult<Self> {
+        let parsed_paths = log_paths.into_iter().map(Into::into).map(Ok);
+        let log_segment_files =
+            LogSegmentFiles::build_log_segment_files(parsed_paths, Vec::new(), 0, None)?;
+        Ok(Self {
+            version,
+            log_segment_files,
+            protocol,
+            metadata,
+            last_checkpoint_hint,
+            crc,
+            version_status,
+        })
+    }
 }
 
 /// Builder for creating [`Snapshot`] instances.
@@ -311,7 +346,8 @@ impl SnapshotBuilder {
     /// matches the version of an existing snapshot.
     ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
-    /// [`MetricEvent::SnapshotBuildFailure`].
+    /// [`MetricEvent::SnapshotBuildFailure`]. Events include `load_type`; hinted builds use
+    /// `snapshot_hint` and emit no child log-load events because they perform no engine I/O.
     ///
     /// # Parameters
     ///
