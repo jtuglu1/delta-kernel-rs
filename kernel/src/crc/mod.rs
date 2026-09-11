@@ -41,7 +41,10 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::table_features::TableFeature;
+use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 
 // ============================================================================
@@ -92,7 +95,7 @@ pub struct Crc {
     ///       `Complete(empty)` and both serde paths could collapse the distinction.
     pub domain_metadata_state: DomainMetadataState,
 
-    // ===== Not yet supported fields =====
+    // ===== Extended fields =====
     /// A unique identifier for the transaction that produced this commit.
     pub(crate) txn_id: Option<String>,
     /// All live [`Add`] file actions at this version.
@@ -107,10 +110,14 @@ pub struct Crc {
 
 impl Crc {
     /// Reconstructs CRC state from its in-memory fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fields do not form semantically consistent CRC state.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
+    pub(crate) fn try_from_parts(
         version: Version,
         metadata: Metadata,
         protocol: Protocol,
@@ -123,8 +130,8 @@ impl Crc {
         num_deleted_records_opt: Option<i64>,
         num_deletion_vectors_opt: Option<i64>,
         deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
-    ) -> Self {
-        Self {
+    ) -> DeltaResult<Self> {
+        let crc = Self {
             version,
             metadata,
             protocol,
@@ -137,7 +144,9 @@ impl Crc {
             num_deleted_records_opt,
             num_deletion_vectors_opt,
             deleted_record_counts_histogram_opt,
-        }
+        };
+        crc.validate()?;
+        Ok(crc)
     }
 
     /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
@@ -147,6 +156,167 @@ impl Crc {
     /// missing file size.
     pub fn file_stats(&self) -> Option<&FileStats> {
         self.file_stats_state.file_stats()
+    }
+
+    fn validate(&self) -> DeltaResult<()> {
+        if let FileStatsState::Complete(stats) = &self.file_stats_state {
+            stats.validate()?;
+        }
+        validate_set_transaction_state(&self.set_transaction_state)?;
+        validate_domain_metadata_state(&self.domain_metadata_state)?;
+
+        if let Some(value) = self.num_deleted_records_opt {
+            require!(
+                value >= 0,
+                Error::generic(format!(
+                    "CRC has invalid numDeletedRecordsOpt: expected a non-negative value, got {value}"
+                ))
+            );
+        }
+        if let Some(value) = self.num_deletion_vectors_opt {
+            require!(
+                value >= 0,
+                Error::generic(format!(
+                    "CRC has invalid numDeletionVectorsOpt: expected a non-negative value, got {value}"
+                ))
+            );
+            if let FileStatsState::Complete(stats) = &self.file_stats_state {
+                require!(
+                    value <= stats.num_files,
+                    Error::generic(format!(
+                        "CRC numDeletionVectorsOpt {value} exceeds numFiles {}",
+                        stats.num_files
+                    ))
+                );
+            }
+        }
+        if let Some(histogram) = &self.deleted_record_counts_histogram_opt {
+            histogram.validate()?;
+            if let FileStatsState::Complete(stats) = &self.file_stats_state {
+                let histogram_num_files = checked_sum(
+                    "deletedRecordCountsHistogramOpt.deletedRecordCounts",
+                    &histogram.deleted_record_counts,
+                )?;
+                require!(
+                    histogram_num_files == stats.num_files,
+                    Error::generic(format!(
+                        "CRC deleted-record histogram file count {histogram_num_files} does not match numFiles {}",
+                        stats.num_files
+                    ))
+                );
+            }
+        }
+        if let Some(all_files) = &self.all_files {
+            self.validate_all_files(all_files)?;
+        }
+        if self.num_deletion_vectors_opt == Some(0) {
+            require!(
+                self.num_deleted_records_opt.is_none_or(|value| value == 0),
+                Error::generic(
+                    "CRC numDeletedRecordsOpt must be zero when numDeletionVectorsOpt is zero"
+                )
+            );
+        }
+
+        let properties = self.metadata.parse_table_properties();
+        let ict_enabled = self
+            .protocol
+            .has_table_feature(&TableFeature::InCommitTimestamp)
+            && properties.enable_in_commit_timestamps == Some(true);
+        require!(
+            !ict_enabled || self.in_commit_timestamp_opt.is_some(),
+            Error::generic(
+                "CRC for an In-Commit-Timestamp-enabled table is missing inCommitTimestampOpt"
+            )
+        );
+        Ok(())
+    }
+
+    fn validate_all_files(&self, all_files: &[Add]) -> DeltaResult<()> {
+        let num_files = i64::try_from(all_files.len())
+            .map_err(|_| Error::generic("allFiles length exceeds the supported range"))?;
+        let table_size_bytes = all_files.iter().try_fold(0_i64, |sum, add| {
+            require!(
+                add.size >= 0,
+                Error::generic(format!(
+                    "allFiles contains negative file size {} for {}",
+                    add.size, add.path
+                ))
+            );
+            sum.checked_add(add.size)
+                .ok_or_else(|| Error::generic("allFiles table size overflow"))
+        })?;
+
+        if let FileStatsState::Complete(stats) = &self.file_stats_state {
+            require!(
+                num_files == stats.num_files,
+                Error::generic(format!(
+                    "CRC allFiles count {num_files} does not match numFiles {}",
+                    stats.num_files
+                ))
+            );
+            require!(
+                table_size_bytes == stats.table_size_bytes,
+                Error::generic(format!(
+                    "CRC allFiles byte total {table_size_bytes} does not match tableSizeBytes {}",
+                    stats.table_size_bytes
+                ))
+            );
+            if let Some(histogram) = &stats.file_size_histogram {
+                histogram.validate_file_sizes(all_files.iter().map(|add| add.size))?;
+            }
+        }
+
+        let mut num_deletion_vectors = 0_i64;
+        let mut num_deleted_records = 0_i64;
+        let mut deleted_record_counts = vec![0_i64; DeletedRecordCountsHistogram::NUM_BINS];
+        for add in all_files {
+            let cardinality = if let Some(deletion_vector) = &add.deletion_vector {
+                require!(
+                    deletion_vector.cardinality >= 0,
+                    Error::generic(format!(
+                        "allFiles contains a deletion vector with negative cardinality {}",
+                        deletion_vector.cardinality
+                    ))
+                );
+                num_deletion_vectors = num_deletion_vectors
+                    .checked_add(1)
+                    .ok_or_else(|| Error::generic("allFiles deletion-vector count overflow"))?;
+                num_deleted_records = num_deleted_records
+                    .checked_add(deletion_vector.cardinality)
+                    .ok_or_else(|| Error::generic("allFiles deleted-record count overflow"))?;
+                deletion_vector.cardinality
+            } else {
+                0
+            };
+            let bin = deleted_record_count_bin(cardinality);
+            deleted_record_counts[bin] = deleted_record_counts[bin]
+                .checked_add(1)
+                .ok_or_else(|| Error::generic("allFiles deleted-record histogram overflow"))?;
+        }
+        if let Some(expected) = self.num_deletion_vectors_opt {
+            require!(
+                num_deletion_vectors == expected,
+                Error::generic(format!(
+                    "CRC allFiles deletion-vector count {num_deletion_vectors} does not match numDeletionVectorsOpt {expected}"
+                ))
+            );
+        }
+        if let Some(expected) = self.num_deleted_records_opt {
+            require!(
+                num_deleted_records == expected,
+                Error::generic(format!(
+                    "CRC allFiles deleted-record count {num_deleted_records} does not match numDeletedRecordsOpt {expected}"
+                ))
+            );
+        }
+        if let Some(expected) = &self.deleted_record_counts_histogram_opt {
+            require!(
+                deleted_record_counts == expected.deleted_record_counts,
+                Error::generic("CRC allFiles does not match deletedRecordCountsHistogramOpt")
+            );
+        }
+        Ok(())
     }
 
     /// Returns the typed file-stats state. Useful for callers that want to inspect the
@@ -175,6 +345,8 @@ impl Serialize for Crc {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CrcRaw {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    txn_id: Option<String>,
     table_size_bytes: i64,
     num_files: i64,
     num_metadata: i64,
@@ -200,6 +372,122 @@ struct CrcRaw {
         skip_serializing_if = "Option::is_none"
     )]
     file_size_histogram: Option<FileSizeHistogram>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    all_files: Option<Vec<CrcAddRaw>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    num_deleted_records_opt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    num_deletion_vectors_opt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CrcAddRaw {
+    path: String,
+    partition_values: HashMap<String, Option<String>>,
+    size: i64,
+    modification_time: i64,
+    data_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tags: Option<HashMap<String, Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deletion_vector: Option<CrcDeletionVectorRaw>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_row_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_row_commit_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clustering_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CrcDeletionVectorRaw {
+    storage_type: String,
+    path_or_inline_dv: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offset: Option<i32>,
+    size_in_bytes: i32,
+    cardinality: i64,
+}
+
+impl CrcAddRaw {
+    fn try_into_add(self) -> DeltaResult<Add> {
+        let deletion_vector = self
+            .deletion_vector
+            .map(CrcDeletionVectorRaw::try_into_deletion_vector)
+            .transpose()?;
+        Ok(Add::from_parts(
+            self.path,
+            self.partition_values
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect(),
+            self.size,
+            self.modification_time,
+            self.data_change,
+            self.stats,
+            self.tags,
+            deletion_vector,
+            self.base_row_id,
+            self.default_row_commit_version,
+            self.clustering_provider,
+        ))
+    }
+}
+
+impl From<&Add> for CrcAddRaw {
+    fn from(add: &Add) -> Self {
+        Self {
+            path: add.path.clone(),
+            partition_values: add
+                .partition_values
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect(),
+            size: add.size,
+            modification_time: add.modification_time,
+            data_change: add.data_change,
+            stats: add.stats.clone(),
+            tags: add.tags.clone(),
+            deletion_vector: add.deletion_vector.as_ref().map(CrcDeletionVectorRaw::from),
+            base_row_id: add.base_row_id,
+            default_row_commit_version: add.default_row_commit_version,
+            clustering_provider: add.clustering_provider.clone(),
+        }
+    }
+}
+
+impl CrcDeletionVectorRaw {
+    fn try_into_deletion_vector(self) -> DeltaResult<DeletionVectorDescriptor> {
+        let storage_type: DeletionVectorStorageType = self
+            .storage_type
+            .parse()
+            .map_err(|error: Error| Error::generic(error.to_string()))?;
+        DeletionVectorDescriptor::try_new(
+            storage_type,
+            self.path_or_inline_dv,
+            self.offset,
+            self.size_in_bytes,
+            self.cardinality,
+        )
+    }
+}
+
+impl From<&DeletionVectorDescriptor> for CrcDeletionVectorRaw {
+    fn from(deletion_vector: &DeletionVectorDescriptor) -> Self {
+        Self {
+            storage_type: deletion_vector.storage_type.to_string(),
+            path_or_inline_dv: deletion_vector.path_or_inline_dv.clone(),
+            offset: deletion_vector.offset,
+            size_in_bytes: deletion_vector.size_in_bytes,
+            cardinality: deletion_vector.cardinality,
+        }
+    }
 }
 
 impl Crc {
@@ -239,50 +527,48 @@ impl Crc {
             }
         }
         // A CRC file on disk is by definition complete; we never deserialize a degraded state.
-        // TODO(#3309): Validate histogram aggregates uniformly across serialized and reconstructed
-        // CRC state.
-        let file_stats_state = FileStatsState::Complete(FileStats {
-            num_files: raw.num_files,
-            table_size_bytes: raw.table_size_bytes,
-            file_size_histogram: raw.file_size_histogram,
-        });
-        Ok(Crc {
+        let file_stats_state = FileStatsState::Complete(FileStats::try_new(
+            raw.num_files,
+            raw.table_size_bytes,
+            raw.file_size_histogram,
+        )?);
+        // Present arrays (including empty `[]`) are authoritative. Absent or null arrays leave
+        // only partial knowledge.
+        let set_transaction_state = match raw.set_transactions {
+            Some(values) => SetTransactionState::try_complete(values)?,
+            None => SetTransactionState::Partial(HashMap::new()),
+        };
+        let domain_metadata_state = match raw.domain_metadata {
+            Some(values) => DomainMetadataState::try_complete(values)?,
+            None => DomainMetadataState::Partial(HashMap::new()),
+        };
+        let all_files = raw
+            .all_files
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(CrcAddRaw::try_into_add)
+                    .collect::<DeltaResult<Vec<_>>>()
+            })
+            .transpose()?;
+        let deleted_record_counts_histogram_opt = raw
+            .deleted_record_counts_histogram_opt
+            .map(|histogram| DeletedRecordCountsHistogram::try_new(histogram.deleted_record_counts))
+            .transpose()?;
+        Crc::try_from_parts(
             version,
-            metadata: raw.metadata,
-            protocol: raw.protocol,
+            raw.metadata,
+            raw.protocol,
             file_stats_state,
-            in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
-            // Present array (including empty `[]`) deserializes as Complete; absent or null
-            // deserializes as Partial(empty).
-            // TODO(#3309): Validate duplicate application IDs uniformly across CRC input paths.
-            set_transaction_state: match raw.set_transactions {
-                Some(values) => SetTransactionState::Complete(
-                    values
-                        .into_iter()
-                        .map(|transaction| (transaction.app_id.clone(), transaction))
-                        .collect(),
-                ),
-                None => SetTransactionState::Partial(HashMap::new()),
-            },
-            // Present array (including empty `[]`) deserializes as Complete; absent or null
-            // deserializes as Partial(empty).
-            // TODO(#3309): Validate duplicates and tombstones uniformly across CRC input paths.
-            domain_metadata_state: match raw.domain_metadata {
-                Some(values) => DomainMetadataState::Complete(
-                    values
-                        .into_iter()
-                        .map(|action| (action.domain().to_string(), action))
-                        .collect(),
-                ),
-                None => DomainMetadataState::Partial(HashMap::new()),
-            },
-            // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
-            txn_id: None,
-            all_files: None,
-            num_deleted_records_opt: None,
-            num_deletion_vectors_opt: None,
-            deleted_record_counts_histogram_opt: None,
-        })
+            raw.in_commit_timestamp_opt,
+            set_transaction_state,
+            domain_metadata_state,
+            raw.txn_id,
+            all_files,
+            raw.num_deleted_records_opt,
+            raw.num_deletion_vectors_opt,
+            deleted_record_counts_histogram_opt,
+        )
     }
 }
 
@@ -290,6 +576,7 @@ impl Crc {
 impl TryFrom<&Crc> for CrcRaw {
     type Error = Error;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
+        crc.validate()?;
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
             return Err(Error::ChecksumWriteUnsupported(format!(
                 "Cannot serialize CRC with {:?} file stats",
@@ -297,6 +584,7 @@ impl TryFrom<&Crc> for CrcRaw {
             )));
         };
         Ok(CrcRaw {
+            txn_id: crc.txn_id.clone(),
             table_size_bytes: stats.table_size_bytes,
             num_files: stats.num_files,
             num_metadata: 1,
@@ -315,6 +603,13 @@ impl TryFrom<&Crc> for CrcRaw {
                 DomainMetadataState::Partial(_) => None,
             },
             file_size_histogram: stats.file_size_histogram.clone(),
+            all_files: crc
+                .all_files
+                .as_ref()
+                .map(|values| values.iter().map(CrcAddRaw::from).collect()),
+            num_deleted_records_opt: crc.num_deleted_records_opt,
+            num_deletion_vectors_opt: crc.num_deletion_vectors_opt,
+            deleted_record_counts_histogram_opt: crc.deleted_record_counts_histogram_opt.clone(),
         })
     }
 }
@@ -372,7 +667,8 @@ where
 /// Bin 9: [2147483647, inf) (files with 2,147,483,647 or more deleted records)
 ///
 /// [DeletedRecordCountsHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deleted-record-counts-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
@@ -380,14 +676,106 @@ pub struct DeletedRecordCountsHistogram {
 }
 
 impl DeletedRecordCountsHistogram {
-    /// Reconstructs a deleted-record-count histogram from its serialized bins.
+    const NUM_BINS: usize = 10;
+
+    /// Reconstructs a deleted-record-count histogram from its serialized bins after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless there are exactly ten bins and every file count is non-negative.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn from_parts(deleted_record_counts: Vec<i64>) -> Self {
-        Self {
+    pub(crate) fn try_new(deleted_record_counts: Vec<i64>) -> DeltaResult<Self> {
+        let histogram = Self {
             deleted_record_counts,
-        }
+        };
+        histogram.validate()?;
+        Ok(histogram)
     }
+
+    fn validate(&self) -> DeltaResult<()> {
+        require!(
+            self.deleted_record_counts.len() == Self::NUM_BINS,
+            Error::generic(format!(
+                "deleted-record-count histogram must contain exactly {} bins, got {}",
+                Self::NUM_BINS,
+                self.deleted_record_counts.len()
+            ))
+        );
+        if let Some((bin, count)) = self
+            .deleted_record_counts
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, count)| *count < 0)
+        {
+            return Err(Error::generic(format!(
+                "deleted-record-count histogram has negative file count {count} at bin {bin}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn checked_sum(name: &str, values: &[i64]) -> DeltaResult<i64> {
+    values.iter().try_fold(0_i64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or_else(|| Error::generic(format!("CRC {name} sum overflow")))
+    })
+}
+
+fn deleted_record_count_bin(cardinality: i64) -> usize {
+    match cardinality {
+        0 => 0,
+        1..=9 => 1,
+        10..=99 => 2,
+        100..=999 => 3,
+        1_000..=9_999 => 4,
+        10_000..=99_999 => 5,
+        100_000..=999_999 => 6,
+        1_000_000..=9_999_999 => 7,
+        10_000_000..=2_147_483_646 => 8,
+        _ => 9,
+    }
+}
+
+fn validate_set_transaction_state(state: &SetTransactionState) -> DeltaResult<()> {
+    let values = match state {
+        SetTransactionState::Complete(values) | SetTransactionState::Partial(values) => values,
+    };
+    for (app_id, transaction) in values {
+        require!(
+            app_id == &transaction.app_id,
+            Error::generic(format!(
+                "CRC transaction map key {app_id} does not match action application id {}",
+                transaction.app_id
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn validate_domain_metadata_state(state: &DomainMetadataState) -> DeltaResult<()> {
+    let (values, state_name) = match state {
+        DomainMetadataState::Complete(values) => (values, "complete"),
+        DomainMetadataState::Partial(values) => (values, "partial"),
+    };
+    for (domain, action) in values {
+        require!(
+            domain == action.domain(),
+            Error::generic(format!(
+                "CRC domain metadata map key {domain} does not match action domain {}",
+                action.domain()
+            ))
+        );
+        require!(
+            !action.is_removed(),
+            Error::generic(format!(
+                "{state_name} CRC state contains a domain metadata tombstone for {domain}"
+            ))
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,7 +784,10 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
+    use super::{
+        Crc, CrcRaw, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState,
+        SetTransactionState,
+    };
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
 
@@ -834,6 +1225,280 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::file_count(
+        1,
+        10,
+        vec![0, 0],
+        vec![0, 10],
+        "file count"
+    )]
+    #[case::byte_total(
+        1,
+        10,
+        vec![1, 0],
+        vec![9, 0],
+        "byte total"
+    )]
+    #[case::file_count_overflow(
+        0,
+        0,
+        vec![i64::MAX, 1],
+        vec![0, 0],
+        "sum overflow"
+    )]
+    #[case::byte_total_overflow(
+        0,
+        0,
+        vec![0, 0],
+        vec![i64::MAX, 1],
+        "sum overflow"
+    )]
+    fn file_stats_reject_histogram_aggregate_errors(
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+        #[case] file_counts: Vec<i64>,
+        #[case] total_bytes: Vec<i64>,
+        #[case] expected: &str,
+    ) {
+        let histogram = FileSizeHistogram::try_new(vec![0, 100], file_counts, total_bytes).unwrap();
+        let error = FileStats::try_new(num_files, table_size_bytes, Some(histogram)).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::transactions(
+        "setTransactions",
+        serde_json::json!([
+            {"appId": "app", "version": 1},
+            {"appId": "app", "version": 2}
+        ]),
+        "duplicate transaction"
+    )]
+    #[case::domains(
+        "domainMetadata",
+        serde_json::json!([
+            {"domain": "domain", "configuration": "{}", "removed": false},
+            {"domain": "domain", "configuration": "{}", "removed": false}
+        ]),
+        "duplicate domain metadata"
+    )]
+    #[case::domain_tombstone(
+        "domainMetadata",
+        serde_json::json!([
+            {"domain": "domain", "configuration": "{}", "removed": true}
+        ]),
+        "tombstone"
+    )]
+    fn de_rejects_duplicate_or_removed_map_state(
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc[field] = value;
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::too_few(vec![0; 9], "exactly 10 bins")]
+    #[case::too_many(vec![0; 11], "exactly 10 bins")]
+    #[case::negative(vec![0, 0, 0, -1, 0, 0, 0, 0, 0, 0], "negative file count")]
+    #[case::sum_overflow(
+        vec![i64::MAX, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        "sum overflow"
+    )]
+    fn de_rejects_invalid_deleted_record_histogram(
+        #[case] counts: Vec<i64>,
+        #[case] expected: &str,
+    ) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc["deletedRecordCountsHistogramOpt"] = serde_json::json!({"deletedRecordCounts": counts});
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::deleted_records("numDeletedRecordsOpt")]
+    #[case::deletion_vectors("numDeletionVectorsOpt")]
+    fn de_rejects_negative_deletion_vector_aggregate(#[case] field: &str) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc[field] = serde_json::json!(-1);
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains(field),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn crc_json_with_one_file() -> serde_json::Value {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(50, 1, 1, 1)).unwrap();
+        crc["fileSizeHistogram"] = serde_json::json!({
+            "sortedBinBoundaries": [0, 100],
+            "fileCounts": [1, 0],
+            "totalBytes": [50, 0]
+        });
+        crc["allFiles"] = serde_json::json!([{
+            "path": "part.parquet",
+            "partitionValues": {"nullable_partition": null},
+            "size": 50,
+            "modificationTime": 1,
+            "dataChange": false
+        }]);
+        crc["numDeletedRecordsOpt"] = serde_json::json!(0);
+        crc["numDeletionVectorsOpt"] = serde_json::json!(0);
+        crc["deletedRecordCountsHistogramOpt"] = serde_json::json!({
+            "deletedRecordCounts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        });
+        crc
+    }
+
+    #[test]
+    fn de_full_file_state_round_trips_through_checked_crc() {
+        let json = crc_json_with_one_file();
+        let crc = Crc::try_from_json_bytes(json.to_string().as_bytes(), 7).unwrap();
+        assert_eq!(crc.version, 7);
+        assert_eq!(crc.all_files.as_ref().unwrap().len(), 1);
+        assert!(crc.all_files.as_ref().unwrap()[0]
+            .partition_values
+            .is_empty());
+
+        let round_tripped = serde_json::to_vec(&crc).unwrap();
+        assert_eq!(Crc::try_from_json_bytes(&round_tripped, 7).unwrap(), crc);
+    }
+
+    #[rstest]
+    #[case::file_count("numFiles", serde_json::json!(2), "allFiles count")]
+    #[case::table_size("tableSizeBytes", serde_json::json!(51), "allFiles byte total")]
+    fn de_rejects_all_files_top_level_mismatch(
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let mut crc = crc_json_with_one_file();
+        crc.as_object_mut().unwrap().remove("fileSizeHistogram");
+        crc.as_object_mut()
+            .unwrap()
+            .remove("deletedRecordCountsHistogramOpt");
+        crc[field] = value;
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn de_rejects_all_files_histogram_bin_mismatch() {
+        let mut crc = crc_json_with_one_file();
+        crc["fileSizeHistogram"]["fileCounts"] = serde_json::json!([0, 1]);
+        crc["fileSizeHistogram"]["totalBytes"] = serde_json::json!([0, 50]);
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("allFiles"));
+    }
+
+    #[test]
+    fn de_rejects_all_files_table_size_overflow() {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(i64::MAX, 2, 1, 1)).unwrap();
+        crc["allFiles"] = serde_json::json!([
+            {"path": "a", "partitionValues": {}, "size": i64::MAX,
+             "modificationTime": 1, "dataChange": false},
+            {"path": "b", "partitionValues": {}, "size": 1,
+             "modificationTime": 1, "dataChange": false}
+        ]);
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("table size overflow"));
+    }
+
+    fn add_deletion_vector(crc: &mut serde_json::Value, cardinality: i64) {
+        crc["allFiles"][0]["deletionVector"] = serde_json::json!({
+            "storageType": "p",
+            "pathOrInlineDv": "file:///dv.bin",
+            "offset": 0,
+            "sizeInBytes": 1,
+            "cardinality": cardinality
+        });
+    }
+
+    #[rstest]
+    #[case::record_count("numDeletedRecordsOpt", serde_json::json!(12), "deleted-record count")]
+    #[case::vector_count("numDeletionVectorsOpt", serde_json::json!(0), "deletion-vector count")]
+    #[case::histogram(
+        "deletedRecordCountsHistogramOpt",
+        serde_json::json!({"deletedRecordCounts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]}),
+        "deletedRecordCountsHistogramOpt"
+    )]
+    fn de_rejects_all_files_deletion_vector_mismatch(
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let mut crc = crc_json_with_one_file();
+        add_deletion_vector(&mut crc, 13);
+        crc["numDeletedRecordsOpt"] = serde_json::json!(13);
+        crc["numDeletionVectorsOpt"] = serde_json::json!(1);
+        crc["deletedRecordCountsHistogramOpt"] = serde_json::json!({
+            "deletedRecordCounts": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        });
+        crc[field] = value;
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn de_rejects_all_files_deleted_record_overflow() {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 2, 1, 1)).unwrap();
+        crc["allFiles"] = serde_json::json!([
+            {"path": "a", "partitionValues": {}, "size": 0,
+             "modificationTime": 1, "dataChange": false},
+            {"path": "b", "partitionValues": {}, "size": 0,
+             "modificationTime": 1, "dataChange": false}
+        ]);
+        add_deletion_vector(&mut crc, i64::MAX);
+        crc["allFiles"][1]["deletionVector"] = crc["allFiles"][0]["deletionVector"].clone();
+        crc["allFiles"][1]["deletionVector"]["cardinality"] = serde_json::json!(1);
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("deleted-record count overflow"));
+    }
+
+    #[test]
+    fn de_requires_ict_when_table_has_ict_enabled() {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc["metadata"]["configuration"] =
+            serde_json::json!({"delta.enableInCommitTimestamps": "true"});
+        crc["protocol"] = serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [],
+            "writerFeatures": ["inCommitTimestamp"]
+        });
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("inCommitTimestampOpt"));
+
+        crc["inCommitTimestampOpt"] = serde_json::json!(1234);
+        Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap();
+    }
+
     // ===== protocol validation on the CRC deserialization path =====
 
     /// Minimal CRC JSON whose `protocol` is the supplied fragment. Proves CRC deserialization
@@ -936,7 +1601,7 @@ mod tests {
     fn de_valid_file_size_histogram_succeeds(#[case] field_name: &str) {
         let json = crc_json_with_histogram(
             field_name,
-            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
+            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [0, 0, 0], "totalBytes": [0, 0, 0]}"#,
         );
         let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_some());
@@ -981,7 +1646,7 @@ mod tests {
     fn ser_uses_spec_field_name_after_deserializing_legacy_alias() {
         let legacy_json = crc_json_with_histogram(
             "histogramOpt",
-            r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
+            r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [0, 0], "totalBytes": [0, 0]}"#,
         );
         let crc = Crc::try_from_json_bytes(legacy_json.as_bytes(), 0).unwrap();
 

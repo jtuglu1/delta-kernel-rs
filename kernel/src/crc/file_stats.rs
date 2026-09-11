@@ -43,7 +43,8 @@ impl FileStats {
     ///
     /// # Errors
     ///
-    /// Returns an error for negative file or byte totals, or negative histogram bins.
+    /// Returns an error for negative file or byte totals, negative histogram bins, checked-sum
+    /// overflow, or histogram aggregates that do not match the top-level totals.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn try_new(
@@ -51,9 +52,20 @@ impl FileStats {
         table_size_bytes: i64,
         file_size_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<Self> {
+        let stats = Self {
+            num_files,
+            table_size_bytes,
+            file_size_histogram,
+        };
+        stats.validate()?;
+        Ok(stats)
+    }
+
+    /// Validates aggregate values and their relationship to the optional histogram.
+    pub(crate) fn validate(&self) -> DeltaResult<()> {
         for (name, value) in [
-            ("numFiles", num_files),
-            ("tableSizeBytes", table_size_bytes),
+            ("numFiles", self.num_files),
+            ("tableSizeBytes", self.table_size_bytes),
         ] {
             if value < 0 {
                 return Err(Error::generic(format!(
@@ -61,15 +73,28 @@ impl FileStats {
                 )));
             }
         }
-        let file_size_histogram = file_size_histogram
-            .map(FileSizeHistogram::check_non_negative)
-            .transpose()
-            .map_err(|error| Error::generic(error.to_string()))?;
-        Ok(Self {
-            num_files,
-            table_size_bytes,
-            file_size_histogram,
-        })
+        if let Some(histogram) = &self.file_size_histogram {
+            histogram.validate_non_negative()?;
+            let histogram_num_files =
+                checked_sum("fileSizeHistogram.fileCounts", &histogram.file_counts)?;
+            require!(
+                histogram_num_files == self.num_files,
+                Error::generic(format!(
+                    "CRC fileSizeHistogram file count {histogram_num_files} does not match numFiles {}",
+                    self.num_files
+                ))
+            );
+            let histogram_table_size =
+                checked_sum("fileSizeHistogram.totalBytes", &histogram.total_bytes)?;
+            require!(
+                histogram_table_size == self.table_size_bytes,
+                Error::generic(format!(
+                    "CRC fileSizeHistogram byte total {histogram_table_size} does not match tableSizeBytes {}",
+                    self.table_size_bytes
+                ))
+            );
+        }
+        Ok(())
     }
 
     /// Returns the number of active [`Add`](crate::actions::Add) file actions in this table
@@ -88,6 +113,13 @@ impl FileStats {
     pub fn file_size_histogram(&self) -> Option<&FileSizeHistogram> {
         self.file_size_histogram.as_ref()
     }
+}
+
+fn checked_sum(name: &str, values: &[i64]) -> DeltaResult<i64> {
+    values.iter().try_fold(0_i64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or_else(|| Error::generic(format!("CRC {name} sum overflow")))
+    })
 }
 
 /// Gross file-change totals from a single commit, plus an optional net file-size histogram.

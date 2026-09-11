@@ -11,8 +11,11 @@
 
 use std::collections::HashMap;
 
+use delta_kernel_derive::internal_api;
+
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
+use crate::{DeltaResult, Error};
 
 /// The state of file statistics for a CRC.
 ///
@@ -94,6 +97,58 @@ impl Default for DomainMetadataState {
     }
 }
 
+impl DomainMetadataState {
+    /// Builds complete domain-metadata state from serialized actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an action is a tombstone or if more than one action has the same
+    /// domain.
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
+        let mut result = HashMap::with_capacity(values.len());
+        for value in values {
+            let domain = value.domain().to_string();
+            if value.is_removed() {
+                return Err(Error::generic(format!(
+                    "complete CRC state contains a domain metadata tombstone for {domain}"
+                )));
+            }
+            if result.insert(domain.clone(), value).is_some() {
+                return Err(Error::generic(format!(
+                    "complete CRC state contains duplicate domain metadata for {domain}"
+                )));
+            }
+        }
+        Ok(Self::Complete(result))
+    }
+
+    /// Builds partial domain-metadata state from known active actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an action is a tombstone or if more than one action has the same
+    /// domain.
+    #[internal_api]
+    pub(crate) fn try_partial(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
+        let mut result = HashMap::with_capacity(values.len());
+        for value in values {
+            let domain = value.domain().to_string();
+            if value.is_removed() {
+                return Err(Error::generic(format!(
+                    "partial CRC state contains a domain metadata tombstone for {domain}"
+                )));
+            }
+            if result.insert(domain.clone(), value).is_some() {
+                return Err(Error::generic(format!(
+                    "partial CRC state contains duplicate domain metadata for {domain}"
+                )));
+            }
+        }
+        Ok(Self::Partial(result))
+    }
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::panic)]
 impl DomainMetadataState {
@@ -137,6 +192,45 @@ pub enum SetTransactionState {
 impl Default for SetTransactionState {
     fn default() -> Self {
         Self::Partial(HashMap::new())
+    }
+}
+
+impl SetTransactionState {
+    /// Builds complete set-transaction state from serialized actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if more than one action has the same application ID.
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<SetTransaction>) -> DeltaResult<Self> {
+        Self::try_from_values(values, true)
+    }
+
+    /// Builds partial set-transaction state from known actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if more than one action has the same application ID.
+    #[internal_api]
+    pub(crate) fn try_partial(values: Vec<SetTransaction>) -> DeltaResult<Self> {
+        Self::try_from_values(values, false)
+    }
+
+    fn try_from_values(values: Vec<SetTransaction>, complete: bool) -> DeltaResult<Self> {
+        let mut result = HashMap::with_capacity(values.len());
+        for value in values {
+            let app_id = value.app_id.clone();
+            if result.insert(app_id.clone(), value).is_some() {
+                return Err(Error::generic(format!(
+                    "CRC state contains duplicate transaction application id {app_id}"
+                )));
+            }
+        }
+        Ok(if complete {
+            Self::Complete(result)
+        } else {
+            Self::Partial(result)
+        })
     }
 }
 

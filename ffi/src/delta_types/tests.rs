@@ -359,7 +359,7 @@ fn typed_crc_accepts_full_kernel_state() {
         default_row_commit_version: OptionalValue::Some(31),
         clustering_provider: OptionalValue::Some(slice("liquid")),
     };
-    let deleted_record_counts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let deleted_record_counts = [0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
     let deleted_record_counts_histogram = FfiDeletedRecordCountsHistogram {
         deleted_record_counts: KernelI64Slice {
             ptr: deleted_record_counts.as_ptr(),
@@ -368,11 +368,19 @@ fn typed_crc_accepts_full_kernel_state() {
     };
     let value = FfiCrc {
         version: 5,
+        file_stats_state: FfiFileStatsState {
+            kind: FfiFileStatsStateKind::Complete,
+            file_stats: FfiFileStats {
+                num_files: 1,
+                table_size_bytes: 17,
+            },
+            file_size_histogram: std::ptr::null(),
+        },
         in_commit_timestamp: OptionalValue::Some(37),
         txn_id: OptionalValue::Some(slice("txn-id")),
         all_files: OptionalValue::Some(FfiAddArray { ptr: &add, len: 1 }),
-        num_deleted_records: OptionalValue::Some(41),
-        num_deletion_vectors: OptionalValue::Some(43),
+        num_deleted_records: OptionalValue::Some(13),
+        num_deletion_vectors: OptionalValue::Some(1),
         deleted_record_counts_histogram: &deleted_record_counts_histogram,
         ..empty_crc()
     };
@@ -403,22 +411,21 @@ fn typed_crc_accepts_full_kernel_state() {
         Some(31),
         Some("liquid".to_string()),
     );
-    let expected = Crc::from_parts(
+    let expected = Crc::try_from_parts(
         5,
         unsafe { test_metadata().try_to_kernel() }.unwrap(),
         unsafe { test_protocol().try_to_kernel() }.unwrap(),
-        FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+        FileStatsState::Complete(FileStats::try_new(1, 17, None).unwrap()),
         Some(37),
         SetTransactionState::Partial(HashMap::new()),
         DomainMetadataState::Partial(HashMap::new()),
         Some("txn-id".to_string()),
         Some(vec![expected_add]),
-        Some(41),
-        Some(43),
-        Some(DeletedRecordCountsHistogram::from_parts(
-            deleted_record_counts.to_vec(),
-        )),
-    );
+        Some(13),
+        Some(1),
+        Some(DeletedRecordCountsHistogram::try_new(deleted_record_counts.to_vec()).unwrap()),
+    )
+    .unwrap();
     assert_eq!(actual, expected);
 
     let indeterminate = FfiCrc {
@@ -436,6 +443,141 @@ fn typed_crc_accepts_full_kernel_state() {
         .unwrap()
         .file_stats()
         .is_none());
+}
+
+#[test]
+fn typed_crc_delegates_semantic_validation_to_kernel() {
+    let transactions = [
+        FfiSetTransaction {
+            app_id: slice("app"),
+            version: 1,
+            last_updated: none_i64(),
+        },
+        FfiSetTransaction {
+            app_id: slice("app"),
+            version: 2,
+            last_updated: none_i64(),
+        },
+    ];
+    let crc = FfiCrc {
+        set_transaction_state: FfiSetTransactionState {
+            kind: FfiSetTransactionStateKind::Complete,
+            transactions: FfiSetTransactionArray {
+                ptr: transactions.as_ptr(),
+                len: transactions.len(),
+            },
+        },
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate transaction"));
+
+    let domains = [
+        FfiDomainMetadata {
+            domain: slice("domain"),
+            configuration: slice("{}"),
+            removed: false,
+        },
+        FfiDomainMetadata {
+            domain: slice("domain"),
+            configuration: slice("{}"),
+            removed: false,
+        },
+    ];
+    let crc = FfiCrc {
+        domain_metadata_state: FfiDomainMetadataState {
+            kind: FfiDomainMetadataStateKind::Complete,
+            domain_metadata: FfiDomainMetadataArray {
+                ptr: domains.as_ptr(),
+                len: domains.len(),
+            },
+        },
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate domain metadata"));
+
+    let tombstone = FfiDomainMetadata {
+        domain: slice("domain"),
+        configuration: slice("{}"),
+        removed: true,
+    };
+    let crc = FfiCrc {
+        domain_metadata_state: FfiDomainMetadataState {
+            kind: FfiDomainMetadataStateKind::Complete,
+            domain_metadata: FfiDomainMetadataArray {
+                ptr: &tombstone,
+                len: 1,
+            },
+        },
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("tombstone"));
+
+    let deleted_record_counts = [0; 9];
+    let deleted_record_counts_histogram = FfiDeletedRecordCountsHistogram {
+        deleted_record_counts: KernelI64Slice {
+            ptr: deleted_record_counts.as_ptr(),
+            len: deleted_record_counts.len(),
+        },
+    };
+    let crc = FfiCrc {
+        deleted_record_counts_histogram: &deleted_record_counts_histogram,
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("exactly 10 bins"));
+
+    let crc = FfiCrc {
+        num_deleted_records: OptionalValue::Some(-1),
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("numDeletedRecordsOpt"));
+
+    let boundaries = [0, 100];
+    let file_counts = [1, 0];
+    let total_bytes = [0, 0];
+    let histogram = FfiFileSizeHistogram {
+        sorted_bin_boundaries: KernelI64Slice {
+            ptr: boundaries.as_ptr(),
+            len: boundaries.len(),
+        },
+        file_counts: KernelI64Slice {
+            ptr: file_counts.as_ptr(),
+            len: file_counts.len(),
+        },
+        total_bytes: KernelI64Slice {
+            ptr: total_bytes.as_ptr(),
+            len: total_bytes.len(),
+        },
+    };
+    let crc = FfiCrc {
+        file_stats_state: FfiFileStatsState {
+            kind: FfiFileStatsStateKind::Complete,
+            file_stats: FfiFileStats {
+                num_files: 0,
+                table_size_bytes: 0,
+            },
+            file_size_histogram: &histogram,
+        },
+        ..empty_crc()
+    };
+    assert!(unsafe { crc.try_to_kernel() }
+        .unwrap_err()
+        .to_string()
+        .contains("does not match numFiles"));
 }
 
 #[test]

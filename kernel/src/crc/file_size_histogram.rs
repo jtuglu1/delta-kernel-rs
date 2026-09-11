@@ -264,16 +264,53 @@ impl FileSizeHistogram {
     /// Used to validate a delta histogram before using it as an absolute histogram (e.g. for
     /// version zero where the delta represents the full table state).
     pub(crate) fn check_non_negative(self) -> DeltaResult<Self> {
+        self.validate_non_negative()?;
+        Ok(self)
+    }
+
+    /// Validates that all bins have non-negative file counts and byte totals.
+    pub(crate) fn validate_non_negative(&self) -> DeltaResult<()> {
         for i in 0..self.sorted_bin_boundaries.len() {
             require!(
                 self.file_counts[i] >= 0 && self.total_bytes[i] >= 0,
-                Error::internal_error(format!(
+                Error::generic(format!(
                     "Histogram has negative counts or bytes at bin {}",
                     i
                 ))
             );
         }
-        Ok(self)
+        Ok(())
+    }
+
+    /// Validates that a complete file list produces exactly this histogram.
+    pub(crate) fn validate_file_sizes(
+        &self,
+        file_sizes: impl IntoIterator<Item = i64>,
+    ) -> DeltaResult<()> {
+        let mut file_counts = vec![0_i64; self.file_counts.len()];
+        let mut total_bytes = vec![0_i64; self.total_bytes.len()];
+        for file_size in file_sizes {
+            require!(
+                file_size >= 0,
+                Error::generic(format!("allFiles contains negative file size {file_size}"))
+            );
+            let bin = self.get_bin_index(file_size);
+            file_counts[bin] = file_counts[bin]
+                .checked_add(1)
+                .ok_or_else(|| Error::generic("allFiles histogram file count overflow"))?;
+            total_bytes[bin] = total_bytes[bin]
+                .checked_add(file_size)
+                .ok_or_else(|| Error::generic("allFiles histogram byte total overflow"))?;
+        }
+        require!(
+            file_counts == self.file_counts,
+            Error::generic("allFiles does not match fileSizeHistogram file counts")
+        );
+        require!(
+            total_bytes == self.total_bytes,
+            Error::generic("allFiles does not match fileSizeHistogram byte totals")
+        );
+        Ok(())
     }
 }
 

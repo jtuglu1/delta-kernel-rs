@@ -143,6 +143,14 @@ impl Crc {
             delta.is_incremental_safe,
         );
 
+        // These optional fields describe one exact version and cannot be updated from CrcDelta.
+        // Drop them when advancing instead of retaining stale state from the base CRC.
+        self.txn_id = None;
+        self.all_files = None;
+        self.num_deleted_records_opt = None;
+        self.num_deletion_vectors_opt = None;
+        self.deleted_record_counts_histogram_opt = None;
+
         self.version = new_version;
         self
     }
@@ -218,7 +226,10 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
-    use crate::crc::{is_incremental_safe_operation, FileSizeHistogram, SetTransactionState};
+    use crate::crc::{
+        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
+        SetTransactionState,
+    };
 
     fn base_crc() -> Crc {
         Crc {
@@ -451,6 +462,27 @@ mod tests {
         }
         .apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    #[test]
+    fn test_apply_clears_exact_version_optional_state() {
+        let crc = Crc {
+            txn_id: Some("transaction".to_string()),
+            all_files: Some(Vec::new()),
+            num_deleted_records_opt: Some(0),
+            num_deletion_vectors_opt: Some(0),
+            deleted_record_counts_histogram_opt: Some(
+                DeletedRecordCountsHistogram::try_new(vec![10, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            ),
+            ..base_crc()
+        }
+        .apply(add_files_delta(0, 0), 1);
+
+        assert!(crc.txn_id.is_none());
+        assert!(crc.all_files.is_none());
+        assert!(crc.num_deleted_records_opt.is_none());
+        assert!(crc.num_deletion_vectors_opt.is_none());
+        assert!(crc.deleted_record_counts_histogram_opt.is_none());
     }
 
     // ===== CrcDelta::into_complete_crc tests =====
