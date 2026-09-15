@@ -11,8 +11,11 @@
 
 use std::collections::HashMap;
 
+use delta_kernel_derive::internal_api;
+
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
+use crate::{DeltaResult, Error};
 
 /// The state of file statistics for a CRC.
 ///
@@ -94,6 +97,41 @@ impl Default for DomainMetadataState {
     }
 }
 
+impl DomainMetadataState {
+    /// Builds complete state, rejecting tombstones and duplicate domains.
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
+        Ok(Self::Complete(domain_metadata_map(values, true)?))
+    }
+
+    /// Builds partial state, rejecting duplicate domains.
+    #[internal_api]
+    pub(crate) fn try_partial(values: Vec<DomainMetadata>) -> DeltaResult<Self> {
+        Ok(Self::Partial(domain_metadata_map(values, false)?))
+    }
+}
+
+fn domain_metadata_map(
+    values: Vec<DomainMetadata>,
+    reject_tombstones: bool,
+) -> DeltaResult<HashMap<String, DomainMetadata>> {
+    let mut result = HashMap::with_capacity(values.len());
+    for value in values {
+        let domain = value.domain().to_string();
+        if reject_tombstones && value.is_removed() {
+            return Err(Error::generic(format!(
+                "complete CRC state contains domain-metadata tombstone for {domain}"
+            )));
+        }
+        if result.insert(domain.clone(), value).is_some() {
+            return Err(Error::generic(format!(
+                "complete CRC state contains duplicate domain {domain}"
+            )));
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::panic)]
 impl DomainMetadataState {
@@ -138,6 +176,33 @@ impl Default for SetTransactionState {
     fn default() -> Self {
         Self::Partial(HashMap::new())
     }
+}
+
+impl SetTransactionState {
+    /// Builds complete state, rejecting duplicate application IDs.
+    #[internal_api]
+    pub(crate) fn try_complete(values: Vec<SetTransaction>) -> DeltaResult<Self> {
+        Ok(Self::Complete(transaction_map(values)?))
+    }
+
+    /// Builds partial state, rejecting duplicate application IDs.
+    #[internal_api]
+    pub(crate) fn try_partial(values: Vec<SetTransaction>) -> DeltaResult<Self> {
+        Ok(Self::Partial(transaction_map(values)?))
+    }
+}
+
+fn transaction_map(values: Vec<SetTransaction>) -> DeltaResult<HashMap<String, SetTransaction>> {
+    let mut result = HashMap::with_capacity(values.len());
+    for value in values {
+        let app_id = value.app_id.clone();
+        if result.insert(app_id.clone(), value).is_some() {
+            return Err(Error::generic(format!(
+                "complete CRC state contains duplicate transaction application id {app_id}"
+            )));
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(any(test, feature = "test-utils"))]

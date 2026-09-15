@@ -941,12 +941,9 @@ impl CommitInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
