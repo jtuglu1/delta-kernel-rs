@@ -51,7 +51,7 @@ the caller's memory space.
 - `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
   (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
-- `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
+- `src/alloc_stats.rs` -- tracked global allocator and native-heap FFI getters
   (`alloc-tracking`)
 
 ## Read Flow
@@ -264,7 +264,7 @@ Feature flags:
 - `arrow-60`, `arrow-59`
 - `delta-kernel-unity-catalog`
 - `tracing`
-- `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
+- `alloc-tracking` -- installs the native-memory tracking global allocator; enables meaningful
   `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
   another `#[global_allocator]` if linked as an rlib)
 
