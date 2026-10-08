@@ -164,6 +164,8 @@ all returned batches: the engine may split a single file across multiple batches
 - `kernel/src/table_properties.rs`: table property parsing (delta.appendOnly, etc.)
 - `kernel/src/table_changes/`: Change Data Feed (CDF) API (`TableChanges`)
 - `kernel/src/path.rs`: Delta log path parsing
+- `kernel/src/utils/alloc_tracking.rs`: advisory live-byte tracking under `internal-api`;
+  FFI and benchmark binaries opt into allocator installation independently
 
 ## Catalog-Managed Tables
 

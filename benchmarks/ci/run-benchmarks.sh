@@ -92,7 +92,33 @@ echo "==========================="
 # HEAD is the merge commit checked out by the workflow; capture it so step 5 can
 # restore this tree after the base checkout below.
 MERGE_SHA=$(git rev-parse HEAD)
+HEAP_RESULTS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/bench-heap.XXXXXX")
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'heap_results_dir=%s\n' "$HEAP_RESULTS_DIR" >> "$GITHUB_OUTPUT"
+fi
+
+# A separate binary/run keeps allocator bookkeeping out of the timing baselines. The feature probe
+# allows comparisons against branches that do not yet have this harness, without inventing zeros.
+run_heap_profile() {
+  local output_path="$1"
+  local metadata supports_heap
+  metadata=$(cargo metadata --locked --no-deps --format-version 1)
+  supports_heap=$(python3 -c '
+import json, sys
+packages = json.load(sys.stdin)["packages"]
+package = next(p for p in packages if p["name"] == "delta_kernel_benchmarks")
+print("true" if "heap-tracking" in package["features"] else "false")
+' <<< "$metadata")
+  if [[ "$supports_heap" == "true" ]]; then
+    BENCH_HEAP_OUTPUT="$output_path" cargo bench --locked -p delta_kernel_benchmarks \
+      --features heap-tracking --bench workload_bench -- --test "$FILTER"
+  else
+    echo "Heap profiling is unavailable on this branch."
+  fi
+}
+
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
+run_heap_profile "$HEAP_RESULTS_DIR/changes.json"
 
 # ---------------------------------------------------------------------------
 # 4. Switch to the base branch and benchmark it
@@ -102,6 +128,7 @@ MERGE_SHA=$(git rev-parse HEAD)
 git fetch origin -- "$BASE_REF"
 git checkout FETCH_HEAD
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
+run_heap_profile "$HEAP_RESULTS_DIR/base.json"
 
 # ---------------------------------------------------------------------------
 # 5. Compare baselines with critcmp and format as a markdown comment
@@ -125,6 +152,11 @@ git checkout "$MERGE_SHA"
 # threshold in this file; benchmark.yml's gate step reads it to fail the job.
 export BENCH_REGRESSION_FILE=/tmp/bench-regression.txt
 COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
+HEAP_ARGS=(--pr "$HEAP_RESULTS_DIR/changes.json")
+if [[ -f "$HEAP_RESULTS_DIR/base.json" ]]; then
+  HEAP_ARGS+=(--base "$HEAP_RESULTS_DIR/base.json")
+fi
+HEAP_COMPARISON=$(python3 benchmarks/ci/compare_heap.py "${HEAP_ARGS[@]}")
 
 # ---------------------------------------------------------------------------
 # 6. Write results to /tmp/bench-comment.md
@@ -148,5 +180,8 @@ SUMMARY+=" &middot; Updated: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M %Z')
 {
   echo "<!-- delta-kernel-bench-comment -->"
   echo "$COMPARISON"
+  echo ""
+  echo "$HEAP_COMPARISON"
+  echo ""
   echo "<sub>${SUMMARY}</sub>"
 } > /tmp/bench-comment.md

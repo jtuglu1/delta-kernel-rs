@@ -75,3 +75,11 @@ verify the pending changelog against every PR since the previous Kernel release.
 `fetch-depth: 0` on that checkout. The regression tests run on every pull request, while live
 verification is restricted to branches whose names start with `release/`; otherwise the window
 between merging a release PR and pushing its tag could block unrelated pull requests.
+
+## Heap benchmark profiles
+
+Run heap profiling separately from Criterion timing so allocator instrumentation does not affect
+the timing regression gate. Heap comparisons are report-only; retain raw JSON samples in the
+`bench-heap-samples` artifact. A base branch without the profiling feature has no baseline, not zero
+allocation usage. Preserve the benchmark workflow's read-only execution and trusted comment-posting
+split described in `SECURITY_MODEL.md`.

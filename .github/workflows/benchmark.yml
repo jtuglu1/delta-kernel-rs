@@ -67,7 +67,9 @@ jobs:
           shared-key: bench
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Compile bench harness
-        run: (cd benchmarks && cargo bench --locked --bench workload_bench --no-run)
+        run: |
+          cargo bench --locked -p delta_kernel_benchmarks --bench workload_bench --no-run
+          cargo bench --locked -p delta_kernel_benchmarks --features heap-tracking --bench workload_bench --no-run
 
   bench-merge-queue-noop:
     # Placeholder job for the merge_group trigger so the workflow can be wired
@@ -216,6 +218,7 @@ jobs:
           shared-key: bench
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run benchmarks
+        id: bench
         # The benchmark-post-comment workflow picks up the uploaded artifact
         # and posts the PR comment in base-branch context (which has the
         # write scope this workflow lacks on fork PRs).
@@ -228,6 +231,12 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           BENCH_IGNORE_FAILURE: ${{ steps.pr.outputs.ignore_failure }}
         run: bash benchmarks/ci/run-benchmarks.sh
+      - name: Upload heap samples
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-heap-samples
+          path: ${{ steps.bench.outputs.heap_results_dir }}
+          if-no-files-found: error
       - name: Upload bench comment
         # Default `if: success()` -- a bench failure leaves no body to post.
         # Runs before the regression gate below so the artifact exists even
@@ -251,3 +260,16 @@ jobs:
             exit 1
           fi
           echo "Regression gate passed (regressed=$REGRESSED, ignore_failure=$IGNORE_FAILURE)."
+
+  test-heap-comparison:
+    name: Test heap comparison
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Test heap report formatter
+        run: python3 -m unittest discover -s benchmarks/ci -p 'test_*.py'

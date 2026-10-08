@@ -10,6 +10,9 @@ use url::Url;
 
 use crate::{KernelError, KernelResult, Result};
 
+#[cfg(feature = "internal-api")]
+pub mod alloc_tracking;
+
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
 /// It is covariant in `T`, and Send+Sync even if `T` is not. Use this instead of [`PhantomData<T>`]

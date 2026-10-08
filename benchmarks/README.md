@@ -19,6 +19,53 @@ cargo install samply
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 ```
 
+### Heap allocation profiles
+
+Run a separate heap-profile pass over the same workloads and registry configurations:
+
+```bash
+BENCH_TAGS=base BENCH_HEAP_OUTPUT=target/heap-results.json \
+  cargo bench --locked -p delta_kernel_benchmarks \
+  --features heap-tracking --bench workload_bench -- --test "snapshotLatest"
+```
+
+`heap-tracking` installs an instrumented system allocator only in the workload bench binary.
+It does not enable FFI allocation tracking or change the normal timing build. The feature requires
+Criterion's `--test` mode: Criterion selects benchmark names, while heap profiling runs outside
+its timing/iteration machinery. An empty selection is an error.
+
+Each workload runs once to warm up, followed by repeated single-operation measurements:
+
+- **Allocated bytes/op:** successful `alloc`/`alloc_zeroed` request sizes plus positive realloc
+  growth. Shrinking or same-sized reallocations add no bytes. This is not the number of bytes
+  copied internally by the system allocator.
+- **Allocation calls/op:** successful `alloc`, `alloc_zeroed`, and `realloc` calls, including
+  shrinking and same-sized reallocations.
+- **Peak extra live bytes/op:** the advisory maximum live bytes above the starting live-byte
+  baseline. This is not cumulative allocation volume.
+
+The JSON sidecar retains individual samples and starting/ending live-byte baselines. Setup,
+warm-up, sample storage, and reporting occur outside measurement windows. The heap runtime uses a
+fixed Tokio worker count; Rayon parallelism comes from the registry configuration.
+
+Counters include Rust allocations across all threads, not just kernel-owned allocations, and
+exclude C/mmap memory and allocator overhead. Runners consume their results, but unrelated
+background allocations and deferred cleanup can affect every metric. Peak resets retain the
+shared allocator's advisory concurrency semantics; no coherent process-wide snapshot or
+quiescence is enforced.
+
+Compare two local reports with:
+
+```bash
+python3 benchmarks/ci/compare_heap.py --base target/heap-base.json --pr target/heap-results.json
+python3 -m unittest discover -s benchmarks/ci -p 'test_*.py'
+```
+
+PR benchmarking runs heap profiling separately from timing and appends median [min, max] values
+and percentage changes to the existing comment. Raw JSON reports are uploaded as
+`bench-heap-samples`. If the base branch lacks `heap-tracking`, the comment reports only PR values.
+Heap comparisons are report-only and do not affect the timing regression gate.
+
 ### Filtering benchmarks
 
 #### By benchmark name

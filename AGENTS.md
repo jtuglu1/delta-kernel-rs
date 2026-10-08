@@ -54,6 +54,11 @@ cargo +nightly fmt \
   && cargo nextest run --workspace --all-features
 ```
 
+Heap workload profiling uses the benchmark-only `heap-tracking` feature in a separate Criterion
+`--test` run; see `benchmarks/README.md`. It shares the live-byte allocator implementation with FFI,
+but adds cumulative bytes/calls only in the benchmark wrapper. It does not enable FFI tracking or
+instrument normal timing benchmarks.
+
 ### Crate Names for `-p` Flag
 
 | Crate                                | Directory                             | Description                                                              |

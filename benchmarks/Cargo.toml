@@ -13,6 +13,8 @@ default = ["arrow"]
 arrow = ["arrow-60"]
 arrow-60 = ["delta_kernel/arrow-60", "delta_kernel_workloads/arrow-60"]
 arrow-59 = ["delta_kernel/arrow-59", "delta_kernel_workloads/arrow-59"]
+# Installs the tracking allocator in the workload bench binary, not in the library or timing runs.
+heap-tracking = []
 
 [build-dependencies]
 flate2 = "1.1"

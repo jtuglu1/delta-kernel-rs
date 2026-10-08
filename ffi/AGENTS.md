@@ -51,8 +51,9 @@ the caller's memory space.
 - `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
   (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
-- `src/alloc_stats.rs` -- tracked global allocator and native-heap FFI getters
-  (`alloc-tracking`)
+- `src/alloc_stats.rs` -- opt-in global allocator installation and native-heap FFI getters
+  (`alloc-tracking`); the live-byte tracker is shared with benchmarks through
+  `delta_kernel::utils::alloc_tracking`
 
 ## Read Flow
 
