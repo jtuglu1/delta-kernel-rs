@@ -76,7 +76,7 @@ mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 mod operation;
-pub(crate) use operation::CommitOperation;
+use operation::CommitOperation;
 pub use operation::UpdateTableOperation;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod leaf_writer;
@@ -179,12 +179,12 @@ pub(crate) fn augmented_write_metadata_schema() -> KernelResult<SchemaRef> {
     with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)
 }
 
-/// Marker type for transactions on existing tables.
+/// Marker type for transactions that update existing tables.
 ///
 /// This is the default state for [`Transaction`] and supports schema changes as well as file
 /// additions, removals, deletion-vector updates, and blind append semantics.
 #[derive(Debug)]
-pub struct ExistingTable;
+pub struct UpdateTable;
 
 /// Marker type for create-table transactions.
 ///
@@ -198,11 +198,11 @@ pub struct CreateTable;
 /// changes to the table.
 ///
 /// The type parameter `S` controls which operations are available:
-/// - [`ExistingTable`] (default): Full API for modifying existing tables.
+/// - [`UpdateTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
 ///
-/// Both states support file additions. Schema-changing transactions use [`ExistingTable`] rather
+/// Both states support file additions. Schema-changing transactions use [`UpdateTable`] rather
 /// than a separate schema-only state, allowing schema and file changes in the same transaction.
 /// The builder validates schema intent, and commit validates the staged actions. Schema-only
 /// behavior is not enforced by the type parameter.
@@ -255,7 +255,7 @@ pub struct CreateTable;
 ///     let _ = txn.with_operation(UpdateTableOperation::Write);
 /// }
 /// ```
-pub struct Transaction<S = ExistingTable> {
+pub struct Transaction<S = UpdateTable> {
     span: tracing::Span,
     // Correlates all metric events emitted by this transaction.
     operation_id: MetricId,
@@ -275,7 +275,7 @@ pub struct Transaction<S = ExistingTable> {
     // schema changes, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
-    operation: Option<CommitOperation>,
+    operation: CommitOperation,
     operation_parameters: Option<HashMap<String, Option<String>>>,
     operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_info: Option<String>,
@@ -326,7 +326,7 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // PhantomType marker for transaction state (ExistingTable or CreateTable).
+    // PhantomType marker for transaction state (UpdateTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomType<S>,
 }
@@ -1018,30 +1018,25 @@ impl<S> Transaction<S> {
     }
 
     fn validate_operation_compatibility(&self) -> KernelResult<()> {
-        if let Some(operation) = &self.operation {
-            operation
-                .validate()
-                .map_err(KernelError::invalid_transaction_state)?;
-        }
-        match (self.is_create_table(), self.operation.as_ref()) {
-            (true, Some(CommitOperation::CreateTable)) => Ok(()),
-            (false, Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)))
+        self.operation
+            .validate()
+            .map_err(KernelError::invalid_transaction_state)?;
+        match (self.is_create_table(), &self.operation) {
+            (true, CommitOperation::CreateTable) => Ok(()),
+            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ))
             }
-            (false, Some(CommitOperation::UpdateTable(_))) => Ok(()),
+            (false, CommitOperation::UpdateTable(_)) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
-            (false, Some(CommitOperation::CreateTable)) => {
-                Err(KernelError::invalid_transaction_state(
-                    "CREATE TABLE cannot use an update-table transaction",
-                ))
-            }
-            (false, _) => Ok(()),
+            (false, CommitOperation::CreateTable) => Err(KernelError::invalid_transaction_state(
+                "CREATE TABLE cannot use an update-table transaction",
+            )),
         }
     }
 
@@ -1176,7 +1171,7 @@ impl<S> Transaction<S> {
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
-            self.operation.as_ref().map(ToString::to_string),
+            Some(self.operation.to_string()),
             self.engine_info.clone(),
             self.is_blind_append,
         );
@@ -1226,9 +1221,7 @@ impl<S> Transaction<S> {
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
         span.record("data_change", self.data_change);
-        if let Some(operation) = &self.operation {
-            span.record("operation", operation.as_str());
-        }
+        span.record("operation", self.operation.as_str());
         span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
         span.record(
             "committer_duration_ns",
@@ -1318,10 +1311,7 @@ impl<S> Transaction<S> {
         // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
         // present, and only operation classification can flip `is_incremental_safe`.
-        let is_incremental_safe = self
-            .operation
-            .as_ref()
-            .is_some_and(CommitOperation::is_incremental_safe);
+        let is_incremental_safe = self.operation.is_incremental_safe();
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1917,7 +1907,7 @@ pub struct PostCommitStats {
 ///   transaction can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
-pub enum CommitResult<S = ExistingTable> {
+pub enum CommitResult<S = UpdateTable> {
     /// The transaction was successfully committed.
     Committed(CommittedTransaction),
     /// This transaction conflicted with an existing version (see
@@ -2004,7 +1994,7 @@ impl CommittedTransaction {
 ///
 /// [conflict version]: Self::conflict_version
 #[derive(Debug)]
-pub struct ConflictedTransaction<S = ExistingTable> {
+pub struct ConflictedTransaction<S = UpdateTable> {
     // TODO: remove after rebase APIs
     #[allow(dead_code)]
     transaction: Transaction<S>,
@@ -2022,7 +2012,7 @@ impl<S> ConflictedTransaction<S> {
 /// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
 /// associated error can be inspected via `RetryableTransaction::error`.
 #[derive(Debug)]
-pub struct RetryableTransaction<S = ExistingTable> {
+pub struct RetryableTransaction<S = UpdateTable> {
     /// The transaction that failed to commit due to a retryable error.
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
@@ -3299,39 +3289,34 @@ mod tests {
     }
 
     #[rstest]
-    #[case::create_without_operation(
-        true,
-        None,
-        "create-table transactions must use the CREATE TABLE operation"
-    )]
     #[case::create_with_update_operation(
         true,
-        Some(CommitOperation::UpdateTable(UpdateTableOperation::Write)),
+        CommitOperation::UpdateTable(UpdateTableOperation::Write),
         "create-table transactions must use the CREATE TABLE operation"
     )]
     #[case::update_with_create_operation(
         false,
-        Some(CommitOperation::CreateTable),
+        CommitOperation::CreateTable,
         "CREATE TABLE cannot use an update-table transaction"
     )]
     #[case::alter_without_schema_changes(
         false,
-        Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)),
+        CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
         "ALTER TABLE requires at least one schema change"
     )]
     #[case::empty_custom_operation(
         false,
-        Some(CommitOperation::UpdateTable(UpdateTableOperation::Custom(String::new()))),
+        CommitOperation::UpdateTable(UpdateTableOperation::Custom(String::new())),
         "custom operation name cannot be empty"
     )]
     #[case::reserved_custom_operation(
         false,
-        Some(CommitOperation::UpdateTable(UpdateTableOperation::Custom("WRITE".to_string()))),
+        CommitOperation::UpdateTable(UpdateTableOperation::Custom("WRITE".to_string())),
         "custom operation name 'WRITE' is reserved"
     )]
     fn operation_compatibility_rejects_invalid_internal_state(
         #[case] is_create_table: bool,
-        #[case] operation: Option<CommitOperation>,
+        #[case] operation: CommitOperation,
         #[case] expected: &str,
     ) -> Result<()> {
         // Public builders reject these states. Mutate private intent to test the runtime guard.

@@ -260,17 +260,21 @@ impl UpdateTableTransactionBuilder {
     /// - Unsupported table writes, schema evolution, or CDF validation failures.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
-    pub fn build(self, engine: &dyn Engine, committer: Box<dyn Committer>) -> Result<Transaction> {
-        self.validate()?;
-        let transaction = try_new_existing_table(self, committer, engine)?;
+    pub fn build(
+        mut self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> Result<Transaction> {
+        let operation = self.operation.take().ok_or_else(|| {
+            KernelError::invalid_transaction_state("Transaction operation must be set before build")
+        })?;
+        self.validate(&operation)?;
+        let transaction = try_new_existing_table(self, operation, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
-    fn validate(&self) -> Result<()> {
-        let operation = self.operation.as_ref().ok_or_else(|| {
-            KernelError::invalid_transaction_state("Transaction operation must be set before build")
-        })?;
+    fn validate(&self, operation: &UpdateTableOperation) -> Result<()> {
         operation
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
@@ -321,13 +325,14 @@ impl UpdateTableTransactionBuilder {
 
 fn try_new_existing_table(
     builder: UpdateTableTransactionBuilder,
+    operation: UpdateTableOperation,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
 ) -> KernelResult<Transaction> {
     let UpdateTableTransactionBuilder {
         snapshot: read_snapshot,
         state,
-        operation,
+        operation: _,
         schema_changes,
         domain_metadata_removals,
         is_blind_append,
@@ -383,7 +388,7 @@ fn try_new_existing_table(
         should_emit_protocol: false,
         should_emit_metadata,
         committer,
-        operation: operation.map(Into::into),
+        operation: operation.into(),
         operation_parameters: None,
         operation_metrics: None,
         engine_info: None,
@@ -461,10 +466,7 @@ mod tests {
             .with_transaction_id("app", 7)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(
-            transaction.operation,
-            Some(UpdateTableOperation::Write.into())
-        );
+        assert_eq!(transaction.operation, UpdateTableOperation::Write.into());
         assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
         assert_eq!(
             transaction.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
@@ -498,10 +500,7 @@ mod tests {
             .with_data_change(true)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(
-            transaction.operation,
-            Some(UpdateTableOperation::Delete.into())
-        );
+        assert_eq!(transaction.operation, UpdateTableOperation::Delete.into());
         assert_eq!(transaction.engine_info.as_deref(), Some("second-engine"));
         assert!(transaction.correlation_id.is_none());
         let parameters = transaction.operation_parameters.as_ref().unwrap();
@@ -620,7 +619,7 @@ mod tests {
 
         assert_eq!(
             transaction.operation,
-            Some(UpdateTableOperation::AlterTable.into())
+            UpdateTableOperation::AlterTable.into()
         );
         assert!(transaction.should_emit_metadata);
         assert!(transaction
