@@ -38,8 +38,8 @@ pub struct Modifying;
 ///
 /// Obtain a builder with [`Snapshot::alter_table`](crate::Snapshot::alter_table), queue at least
 /// one schema operation, then call [`build`](Self::build). The operation is fixed to `ALTER TABLE`
-/// and `dataChange` is always `false`. File writes and schema evolution during writes belong on
-/// [`UpdateTableTransactionBuilder`](super::update_table::UpdateTableTransactionBuilder).
+/// and `dataChange` is always `false`. The built transaction can rewrite files with the evolved
+/// schema, provided the connector preserves logical data.
 ///
 /// Schema operations are shared with the update-table builder:
 /// [`add_column`](TransactionBuilder::add_column),
@@ -177,6 +177,14 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// 4. Builds the evolved table configuration
     /// 5. Creates the transaction
     ///
+    /// Note: For tables with clustering enabled, this performs log replay to read clustering
+    /// columns from domain metadata, which may have a performance cost.
+    ///
+    /// # Parameters
+    ///
+    /// - `engine`: Provides table-state reads needed to prepare write metadata.
+    /// - `committer`: Executes the eventual atomic commit.
+    ///
     /// # Errors
     ///
     /// - The table enables `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults`, which
@@ -190,11 +198,11 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - Shared transaction metadata is invalid
     pub fn build(
         self,
-        _engine: &dyn Engine,
+        engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<AlterTableTransaction> {
         self.common_state.validate()?;
-        let transaction = try_new_existing_table(self, committer)?;
+        let transaction = try_new_existing_table(self, engine, committer)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }

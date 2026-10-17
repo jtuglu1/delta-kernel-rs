@@ -1200,7 +1200,8 @@ impl Snapshot {
     /// `engine_info` identifies the connector in commit history. The transaction fixes its
     /// operation to `ALTER TABLE` and `dataChange` to `false`.
     ///
-    /// Use [`Self::update_table`] to evolve the schema together with data writes.
+    /// The built transaction supports file rewrites and deletion-vector relocation that preserve
+    /// logical data. Use [`Self::update_table`] to evolve the schema while changing logical data.
     ///
     /// [`AlterTableTransaction`]: crate::transaction::AlterTableTransaction
     pub fn alter_table(
