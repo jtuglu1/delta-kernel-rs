@@ -77,6 +77,7 @@ pub mod ffi_metrics;
 pub mod ffi_tracing;
 pub mod incremental_scan;
 pub mod log_path;
+pub mod log_segment;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
@@ -4254,5 +4255,20 @@ mod tests {
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
         Ok(())
+    }
+}
+
+/// Drops a uniquely owned snapshot, returning the handle if other references remain.
+///
+/// # Safety
+/// `snapshot` must be a valid owned handle. It is consumed regardless of the result;
+/// any returned handle becomes the caller's responsibility.
+#[no_mangle]
+pub unsafe extern "C" fn try_free_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<Handle<SharedSnapshot>> {
+    match std::sync::Arc::try_unwrap(unsafe { snapshot.into_inner() }) {
+        Ok(_) => OptionalValue::None,
+        Err(snapshot) => OptionalValue::Some(snapshot.into()),
     }
 }
