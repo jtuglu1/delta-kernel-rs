@@ -477,6 +477,10 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - name: Record Miri runner resources
+        run: |
+          lscpu
+          free -m
       - name: Test with Miri
         env:
           CARGO_INCREMENTAL: ${{ inputs.incremental || '1' }}
@@ -485,7 +489,7 @@ jobs:
         # frequency, so it does not weaken undefined-behavior or data-race detection.
         run: |
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" /usr/bin/time -v cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
