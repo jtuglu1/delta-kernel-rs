@@ -19,8 +19,8 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::checkpoint::{
-    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
-    ensure_standalone_checkpoint_supported,
+    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -63,7 +63,6 @@ mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
-mod checkpoint_type;
 #[cfg(test)]
 mod crc_write_tests;
 mod hint;
@@ -71,7 +70,6 @@ mod incremental;
 mod reader;
 mod snapshot_crc;
 
-pub use checkpoint_type::SelectedCheckpointType;
 #[cfg(test)]
 mod tracing_tests;
 #[doc(hidden)]

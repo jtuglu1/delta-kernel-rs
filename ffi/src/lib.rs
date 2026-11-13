@@ -50,6 +50,7 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+pub mod checkpoint;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
