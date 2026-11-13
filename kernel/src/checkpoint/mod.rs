@@ -147,6 +147,8 @@ mod sidecar;
 mod types;
 
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
+#[delta_kernel_derive::internal_api]
+pub(crate) use types::SelectedCheckpoint;
 pub use types::SelectedCheckpointType;
 #[cfg(test)]
 pub(crate) mod tests;
