@@ -40,8 +40,8 @@ pub struct DeltaErrorInfo {
     pub message: KernelStringSlice,
     /// Construction-site Rust backtrace, absent when capture is disabled or unsupported.
     ///
-    /// Capture follows Rust's `RUST_LIB_BACKTRACE` and `RUST_BACKTRACE` configuration. The trace
-    /// belongs to the original error; converting it for FFI does not capture another stack.
+    /// Capture follows Rust's environment settings or [`super::enable_error_backtraces`]. The
+    /// trace belongs to the original error; converting it for FFI does not capture another stack.
     pub backtrace: OptionalValue<KernelStringSlice>,
     /// Rendered source messages, ordered from the immediate cause to the root cause.
     pub sources: FfiSlice<KernelStringSlice>,
