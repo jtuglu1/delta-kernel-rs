@@ -79,7 +79,8 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 pub use reader::SnapshotReader;
-use snapshot_crc::SnapshotCrc;
+pub use snapshot_crc::CrcSource;
+pub(crate) use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;
@@ -228,16 +229,19 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
     ) -> KernelResult<Self> {
+        let crc = SnapshotCrc::from_parts(None, table_configuration.version(), CrcSource::Unknown);
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            None,  /* crc */
+            crc,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
     }
 
-    /// Internal constructor that accepts an explicit pre-resolved CRC.
+    /// Constructs a snapshot from resolved CRC state, classifying its source for the target
+    /// version. The CRC state carries its disk origin through derivations; callers do not
+    /// recompute it.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
     /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
@@ -245,7 +249,7 @@ impl Snapshot {
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
-        crc: Option<Arc<Crc>>,
+        crc: SnapshotCrc,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> KernelResult<Self> {
@@ -268,13 +272,32 @@ impl Snapshot {
     fn validate_configuration_and_crc(
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
-        crc: Option<Arc<Crc>>,
+        crc: SnapshotCrc,
     ) -> KernelResult<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
-        SnapshotCrc::try_new(
-            crc,
+        crc.for_snapshot(
             table_configuration.version(),
             log_segment.checkpoint_version(),
+        )
+    }
+
+    /// Constructs test snapshots from explicit CRC and source inputs.
+    #[cfg(test)]
+    pub(crate) fn new_with_crc_and_source(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        crc: Option<Arc<Crc>>,
+        source: CrcSource,
+        built_as_latest: bool,
+        skipped_new_checkpoints: bool,
+    ) -> KernelResult<Self> {
+        let crc = SnapshotCrc::from_parts(crc, table_configuration.version(), source);
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            skipped_new_checkpoints,
         )
     }
 
@@ -467,25 +490,31 @@ impl Snapshot {
             .read_latest_crc(engine)
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget(engine, &base_crc, incremental_replay)
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full) and, under AMT,
         //         how it resolved the latest checkpoint action.
-        let PmResolution {
-            metadata,
-            protocol,
-            source,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            captured_checkpoint_action,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_manifest_commit,
-        } = match &crc_at_version {
-            Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
-            None => log_segment
-                .read_protocol_metadata_opt(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
+        let (
+            crc,
+            PmResolution {
+                metadata,
+                protocol,
+                source,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                captured_checkpoint_action,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit,
+            },
+        ) = match crc_at_version {
+            Some(result) => result,
+            None => {
+                let resolution = log_segment
+                    .read_protocol_metadata_opt(engine, base_crc.as_ref())
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+                (base_crc, resolution)
+            }
         };
 
         // Fresh snapshot creation requires both Protocol and Metadata to be present.
@@ -508,7 +537,6 @@ impl Snapshot {
             log_segment.end_version,
         )?;
 
-        let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
         let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
         Ok(PreparedSnapshot {
             table_configuration,
@@ -573,15 +601,7 @@ impl Snapshot {
         let last_manifest_commit =
             LastManifestCommitResolution::Resolved(crc_delta.last_manifest_commit.clone());
 
-        // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
-        // a stale base is carried forward unadvanced.
-        let new_crc = match self.crc_at_version() {
-            Some(base) => Some(Arc::new(
-                base.as_ref().clone().apply(crc_delta, new_version),
-            )),
-            None => self.base_crc().cloned(),
-        };
-
+        let new_crc = self.crc.apply_commit(crc_delta, new_version);
         let new_crc = Self::validate_configuration_and_crc(
             &new_log_segment,
             &new_table_configuration,
@@ -628,11 +648,21 @@ impl Snapshot {
         self.log_segment.checkpoint_type()
     }
 
+    /// Returns retained checksum provenance without performing engine I/O.
+    ///
+    /// The value records what snapshot construction observed about checksum files; it does not
+    /// depend on whether the checksum carries complete file statistics.
+    pub fn crc_source(&self) -> CrcSource {
+        self.crc.source()
+    }
+
     /// Captures retained snapshot state as an owned hint without engine I/O.
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
     /// The selected checkpoint type is retained without refining an unresolved observation.
+    /// Checksum provenance is preserved for exported CRCs and absent CRC observations. Omitting a
+    /// stale CRC resets its provenance to `Unknown`.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// # Errors
@@ -666,11 +696,14 @@ impl Snapshot {
         self.crc.at_version()
     }
 
-    /// The held CRC regardless of version, for reuse that does not require an at-version CRC
-    /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
+    /// Returns the CRC kept in memory, which may be older than [`Self::version`].
+    /// A returned CRC does not imply that a CRC file exists on disk at that version; commits may
+    /// have been incrementally replayed in memory on top of an older-versioned CRC.
+    ///
+    /// Prefer [`Self::crc_at_version`] for authoritative queries.
     /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
     pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.base()
+        self.crc.as_ref()
     }
 
     /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
@@ -1518,7 +1551,7 @@ impl Snapshot {
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
                     new_log_segment,
                     self.table_configuration().clone(),
-                    Some(crc),
+                    SnapshotCrc::from_file(crc),
                     self.built_as_latest,
                     self.skipped_new_checkpoints,
                 )?);
@@ -1804,11 +1837,11 @@ impl Snapshot {
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path, checkpoint_type)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
-        // stale base could no longer be advanced over them.
+        // stale base could no longer be advanced over them. Dropping it leaves provenance unknown.
         let new_snapshot = Arc::new(Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
-            self.crc_at_version().cloned(),
+            self.crc.retain_at_version(),
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
         )?);
@@ -1910,7 +1943,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             log_segment,
             self.table_configuration().clone(),
-            self.base_crc().cloned(),
+            self.crc.clone(),
             self.built_as_latest,
             self.skipped_new_checkpoints,
         )?))
@@ -2074,7 +2107,17 @@ mod tests {
                 ..Default::default()
             })
         });
-        Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
+        Arc::new(
+            Snapshot::new_with_crc_and_source(
+                segment,
+                configuration,
+                crc,
+                CrcSource::Unknown,
+                true,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     fn engine_with_published_commits() -> SyncEngine {
@@ -2131,6 +2174,7 @@ mod tests {
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
+        assert_eq!(published.crc_source(), source.crc_source());
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -2207,10 +2251,11 @@ mod tests {
             )
             .unwrap();
         let source = Arc::new(
-            Snapshot::new_with_crc(
+            Snapshot::new_with_crc_and_source(
                 segment,
                 source.table_configuration().clone(),
                 None,
+                CrcSource::Unknown,
                 false,
                 false,
             )
@@ -2520,10 +2565,11 @@ mod tests {
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
 
-        Snapshot::new_with_crc(
+        Snapshot::new_with_crc_and_source(
             log_segment,
             table_cfg,
-            None,  /* crc */
+            None, /* crc */
+            CrcSource::Unknown,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -3313,10 +3359,11 @@ mod tests {
         commit(table_root, store.as_ref(), 0, commit_data).await;
         let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
-        let snapshot = Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc_and_source(
             loaded_snapshot.log_segment().clone(),
             loaded_snapshot.table_configuration().clone(),
             None,
+            CrcSource::Unknown,
             false,
             false, /* skipped_new_checkpoints */
         )?;
@@ -3422,10 +3469,11 @@ mod tests {
             version: 0,
             ..Default::default()
         });
-        let parent = Snapshot::new_with_crc(
+        let parent = Snapshot::new_with_crc_and_source(
             built.log_segment().clone(),
             built.table_configuration().clone(),
             Some(stale_crc),
+            CrcSource::Unknown,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -3449,6 +3497,67 @@ mod tests {
             post.base_crc().map(|c| c.version),
             Some(0),
             "the stale base must be carried forward, not dropped"
+        );
+    }
+
+    #[rstest]
+    #[case::at_version(Some(2), CrcSource::AtVersion, CrcSource::Reconstructed { on_disk_version: 2 })]
+    #[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0 }, CrcSource::Reconstructed { on_disk_version: 0 })]
+    #[case::stale(Some(0), CrcSource::Stale { on_disk_version: 0 }, CrcSource::Stale { on_disk_version: 0 })]
+    #[case::unknown_stale(Some(0), CrcSource::Unknown, CrcSource::Unknown)]
+    #[case::missing(None, CrcSource::Missing, CrcSource::Missing)]
+    #[case::unusable(None, CrcSource::Unusable, CrcSource::Unusable)]
+    #[case::unknown(None, CrcSource::Unknown, CrcSource::Unknown)]
+    fn test_new_post_commit_preserves_provenance(
+        #[case] crc_version: Option<Version>,
+        #[case] source: CrcSource,
+        #[case] expected_source: CrcSource,
+    ) {
+        // Given a snapshot with an optional retained checksum and its provenance.
+        let built = snapshot_with_staged_commits(Some(2), crc_version, false);
+        let parent = Snapshot::new_with_crc_and_source(
+            built.log_segment().clone(),
+            built.table_configuration().clone(),
+            built.base_crc().cloned(),
+            source,
+            false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
+        )
+        .unwrap();
+
+        // When a committed action advances the snapshot without storage I/O.
+        let commit = ParsedLogPath::create_parsed_published_commit(parent.table_root(), 3);
+        let post = parent
+            .new_post_commit(
+                commit,
+                CrcDelta::default(),
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                None,
+            )
+            .unwrap();
+
+        // Then at-version CRCs advance and stale or absent state is retained.
+        assert_eq!(post.version(), 3);
+        assert_eq!(post.log_segment().end_version, 3);
+        assert_eq!(post.crc_source(), expected_source);
+        assert_eq!(
+            post.base_crc().map(|crc| crc.version),
+            crc_version.map(|version| {
+                if version == parent.version() {
+                    3
+                } else {
+                    version
+                }
+            })
+        );
+        assert_eq!(parent.base_crc().map(|crc| crc.version), crc_version);
+        assert_eq!(
+            parent.crc_at_version().map(|crc| crc.version),
+            crc_version.filter(|v| *v == 2)
+        );
+        assert_eq!(
+            post.crc_at_version().map(|crc| crc.version),
+            crc_version.filter(|v| *v == 2).map(|_| 3)
         );
     }
 

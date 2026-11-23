@@ -13,7 +13,7 @@ use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
-use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::snapshot::{CrcSource, IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
@@ -29,6 +29,7 @@ use crate::ffi_test_utils::{
 };
 use crate::log_path::FfiLogPath;
 use crate::snapshot::snapshot_checkpoint_type;
+use crate::snapshot::snapshot_crc::snapshot_crc_source;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
@@ -271,7 +272,8 @@ fn test_snapshot_hint(
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
-        checkpoint_type: OptionalValue::None,
+        checkpoint_type: std::ptr::null(),
+        crc_source: std::ptr::null(),
     }
 }
 
@@ -369,7 +371,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     let log_path = FfiLogPath::new(slice(location), 123, 456);
     let crc = empty_crc();
     let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
-    hint.checkpoint_type = checkpoint_type.into();
+    hint.checkpoint_type = checkpoint_type.as_ref().map_or(std::ptr::null(), |t| t);
     if with_crc {
         hint.crc = &crc;
     }
@@ -447,7 +449,7 @@ fn checkpoint_type_claim_rejects_conflicting_paths(
         .map(|location| FfiLogPath::new(slice(location), 0, 1))
         .collect();
     let mut hint = test_snapshot_hint(&paths, 0, FfiSnapshotHintFreshness::Unverified);
-    hint.checkpoint_type = OptionalValue::Some(claimed_type);
+    hint.checkpoint_type = &claimed_type;
     let builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
@@ -1259,6 +1261,8 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         None,
         Some(Arc::new(expected_crc.clone())),
         SnapshotHintFreshness::Unverified,
+        None,
+        None,
     )
     .unwrap();
     let kernel_engine = unsafe { engine.as_ref() }.engine();
@@ -1597,7 +1601,8 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
-        checkpoint_type: OptionalValue::None,
+        checkpoint_type: std::ptr::null(),
+        crc_source: std::ptr::null(),
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
@@ -2377,6 +2382,65 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     );
 
     unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+#[rstest::rstest]
+#[case::at_version(Some(2), CrcSource::AtVersion, CrcSource::AtVersion)]
+#[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0 }, CrcSource::Reconstructed { on_disk_version: 0 })]
+#[case::missing(None, CrcSource::Missing, CrcSource::Missing)]
+#[case::unusable(None, CrcSource::Unusable, CrcSource::Unusable)]
+#[case::unknown(Some(2), CrcSource::Unknown, CrcSource::Unknown)]
+#[case::unknown_absent(None, CrcSource::Unknown, CrcSource::Unknown)]
+#[case::inconsistent(Some(2), CrcSource::Missing, CrcSource::Unknown)]
+#[case::future_disk_version(Some(2), CrcSource::Reconstructed { on_disk_version: 3 }, CrcSource::Unknown)]
+#[case::stale_at_version(Some(2), CrcSource::Stale { on_disk_version: 0 }, CrcSource::Unknown)]
+fn checksum_telemetry_round_trips_without_changing_hint_state(
+    #[case] crc_version: Option<u64>,
+    #[case] source: CrcSource,
+    #[case] expected: CrcSource,
+) {
+    // Given an upstream-valid hint with optional CRC telemetry.
+    let engine = test_engine();
+    let paths = [
+        "memory:///hinted-table/_delta_log/00000000000000000000.json",
+        "memory:///hinted-table/_delta_log/00000000000000000001.json",
+        "memory:///hinted-table/_delta_log/00000000000000000002.json",
+    ]
+    .map(|path| FfiLogPath::new(slice(path), 123, 456));
+    let mut crc = empty_crc();
+    crc.version = 2;
+    let ffi_provenance = source.into();
+    let hint = FfiSnapshotHint {
+        crc: crc_version.map_or(std::ptr::null(), |_| &crc),
+        crc_source: &ffi_provenance,
+        ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Unverified)
+    };
+
+    // When the hint is installed, built, and exported through the FFI.
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt = rebuild_through_visitor(&snapshot, &engine);
+    let mut observed = std::mem::MaybeUninit::uninit();
+    unsafe { snapshot_crc_source(rebuilt.shallow_copy(), observed.as_mut_ptr()) };
+
+    // Then telemetry survives, invalid claims become Unknown, and CRC presence is unchanged.
+    assert_eq!(unsafe { observed.assume_init() }, expected.into());
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(
+        rebuilt_ref.crc_at_version().map(|crc| crc.version),
+        crc_version
+    );
+    assert_eq!(rebuilt_ref.version(), 2);
+    unsafe {
+        free_snapshot(rebuilt);
         free_snapshot(snapshot);
         free_engine(engine);
     }

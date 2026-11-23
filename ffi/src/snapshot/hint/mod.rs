@@ -11,7 +11,8 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
+use crate::snapshot::snapshot_crc::FfiCrcSource;
+use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -87,17 +88,25 @@ pub struct FfiSnapshotHint {
     pub metadata: FfiMetadata,
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
-    /// Optional CRC state. Null means absent.
+    /// Optional CRC state at `version`. Null means absent; older or newer CRCs are rejected.
+    /// A retained CRC does not imply that a CRC file exists on disk at that version; commits may
+    /// have been incrementally replayed in memory on top of an older-versioned CRC.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
     /// Optional selected-checkpoint type claim, validated against the supplied paths at build.
-    /// Absent leaves the type to be inferred from paths and matching `_last_checkpoint` state.
-    /// C callers must explicitly set the tag to `NoneFfiSelectedCheckpointType` when absent:
-    /// zero-initializing this field produces `Some(Unresolved)`, which requires a checkpoint.
-    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
+    /// Null leaves the type to be inferred from paths and matching `_last_checkpoint` state.
+    pub checkpoint_type: *const FfiSelectedCheckpointType,
+    /// Optional checksum telemetry. Null means unknown. It does not change CRC validation,
+    /// retention, or snapshot success. An inconsistent claim is reported as `Unknown`.
+    /// `Missing` and `Unusable` require no CRC. `AtVersion` requires an at-version CRC;
+    /// `Reconstructed` requires an at-version CRC and an older `on_disk_version`.
+    /// `Stale` is inconsistent with hints, which only accept at-version CRCs.
+    /// Export includes the observation, but omitting a stale CRC resets its provenance to
+    /// `Unknown`.
+    pub crc_source: *const FfiCrcSource,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -164,12 +173,13 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-    )?
-    .with_checkpoint_type(
-        Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
+        unsafe { value.checkpoint_type.as_ref() }
             .copied()
             .map(Into::into),
-    );
+        unsafe { value.crc_source.as_ref() }
+            .copied()
+            .map(Into::into),
+    )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }

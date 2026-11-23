@@ -5,6 +5,7 @@ use crate::{Handle, OptionalValue, SharedSnapshot};
 
 mod builder;
 pub mod hint;
+pub mod snapshot_crc;
 
 pub use builder::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,

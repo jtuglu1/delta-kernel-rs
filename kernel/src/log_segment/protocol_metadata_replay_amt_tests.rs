@@ -36,6 +36,7 @@ use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanExecutor, PlanResult};
 use crate::schema::SchemaRef;
+use crate::snapshot::CrcSource;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -1329,10 +1330,11 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
         last_manifest_commit_opt: expected.clone(),
         ..Default::default()
     };
-    let snapshot = Snapshot::new_with_crc(
+    let snapshot = Snapshot::new_with_crc_and_source(
         loaded.log_segment().clone(),
         loaded.table_configuration().clone(),
         Some(Arc::new(crc)),
+        CrcSource::Unknown,
         false, /* built_as_latest */
         false, /* skipped_new_checkpoints */
     )
