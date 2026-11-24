@@ -12,6 +12,10 @@ design decisions. This map provides entry points and broader design context.
 | Task | Start here | Related implementation |
 |------|------------|------------------------|
 | Load or refresh a snapshot | `kernel/src/snapshot/` | `log_segment/`, `log_reader/`, `crc/` |
+<<<<<<< HEAD:CLAUDE/architecture.md
+=======
+| Inspect checksum provenance | `kernel/src/snapshot/snapshot_crc.rs` | `crc/mod.rs`, `snapshot/hint.rs` |
+>>>>>>> 7ef65d83 (refactor: carry checksum origin on CRC and simplify FFI):AGENTS/architecture.md
 | Build or execute a read | `kernel/src/scan/` | `log_replay/`, `actions/deletion_vector.rs` |
 | Read changes between versions | `kernel/src/incremental_scan/`, `kernel/src/table_changes/` | `log_replay/` |
 | Create or modify a table | `kernel/src/transaction/` | `committer/`, `partition/` |

@@ -1841,7 +1841,10 @@ mod tests {
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
         assert_eq!(
             snapshot_a.crc_source(),
-            CrcSource::Reconstructed { on_disk_version: 1 }
+            CrcSource::Reconstructed {
+                on_disk_version: 1,
+                crc_version: 3
+            }
         );
         let snapshot_a = if known_provenance {
             snapshot_a
@@ -1871,7 +1874,10 @@ mod tests {
             assert_eq!(
                 stale.crc_source(),
                 if known_provenance {
-                    CrcSource::Stale { on_disk_version: 1 }
+                    CrcSource::Stale {
+                        on_disk_version: 1,
+                        crc_version: 3,
+                    }
                 } else {
                     CrcSource::Unknown
                 }
@@ -1922,10 +1928,12 @@ mod tests {
                 if expected_crc_v.is_some() {
                     CrcSource::Reconstructed {
                         on_disk_version: expected_base_version,
+                        crc_version: 5,
                     }
                 } else {
                     CrcSource::Stale {
                         on_disk_version: expected_base_version,
+                        crc_version: 3,
                     }
                 }
             } else {
