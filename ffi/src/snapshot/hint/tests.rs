@@ -371,7 +371,7 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     let log_path = FfiLogPath::new(slice(location), 123, 456);
     let crc = empty_crc();
     let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
-    hint.checkpoint_type = checkpoint_type.as_ref().map_or(std::ptr::null(), |t| t);
+    hint.checkpoint_type = checkpoint_type.into();
     if with_crc {
         hint.crc = &crc;
     }
