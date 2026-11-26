@@ -106,10 +106,9 @@ pub struct FfiSnapshotHint {
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
     /// Optional CRC provenance. A current CRC must match the snapshot hint version. On import its
     /// origin becomes `SnapshotHint` and any supplied disk version is preserved. Omitting the
-    /// status with a CRC leaves the disk version unspecified. Without a CRC, an omitted status or
-    /// `Absent` yields `Absent`, and `Unusable` preserves a reported failure. A snapshot hint
-    /// cannot carry a stale CRC. Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting
-    /// status.
+    /// status with a CRC leaves the disk version unspecified. Without a CRC, an omitted, `Absent`,
+    /// or `Unusable` status yields a snapshot hint with no CRC provenance. A snapshot hint cannot
+    /// carry a stale CRC. Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting status.
     pub crc_provenance: OptionalValue<FfiSnapshotCrcProvenance>,
 }
 
